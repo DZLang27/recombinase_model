@@ -4,6 +4,7 @@ __pycache__/
 *.egg-info/
 .agents/
 .codex/
+PROJECT_MEMORY_FOR_CODEX.md
 
 # 大体积可再生文件与实验输出
 data/

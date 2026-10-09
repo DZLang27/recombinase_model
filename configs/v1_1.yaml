@@ -1,0 +1,84 @@
+data:
+  train_file: train_dataset_with_neg.txt
+  test_file: test_dataset_with_neg.txt
+  processed_dir: data/processed
+  expected_counts:
+    train_unique_proteins: 37217
+    train_unique_dnas: 179059
+    train_category_memberships: 198099
+    train_unique_labeled_pairs: 197911
+    train_conflicting_pairs_removed: 1
+    test_unique_queries: 3672
+    test_unique_candidates: 1287
+    test_truth_pairs: 4143
+    train_dnas_rc_mapping_count: 179059
+    train_dnas_rc_only_count: 165991
+    test_queries_rc_mapping_count: 3672
+    test_queries_rc_only_count: 3002
+
+backbones:
+  protein:
+    model: facebook/esm2_t30_150M_UR50D
+    revision: a695f6045e2e32885fa60af20c13cb35398ce30c
+    hidden_dim: 640
+    trust_remote_code: false
+    batch_size: 16
+  dna:
+    model: InstaDeepAI/nucleotide-transformer-v2-100m-multi-species
+    revision: f34324c6fde36a4f635f0f1f06cac5d25acd6798
+    hidden_dim: 512
+    trust_remote_code: true
+    batch_size: 64
+  pooling: special_token_mean
+  embedding_dtype: float32
+
+model:
+  projection_hidden_dim: 512
+  projection_dim: 256
+  dropout: 0.1
+  gamma_init: 5.0
+  gamma_epsilon: 1.0e-6
+  gamma_warning_threshold: 100.0
+
+training:
+  epochs: 20
+  proteins_per_batch: 128
+  projection_learning_rate: 1.0e-3
+  gamma_learning_rate: 1.0e-4
+  projection_weight_decay: 1.0e-4
+  gamma_weight_decay: 1.0e-2
+  gradient_clip_norm: 1.0
+  ranking_loss_weight: 0.25
+  ranking_margin: 0.10
+  reverse_complement_augmentation_fraction: 1.0
+  amp: true
+  seed: 42
+  num_workers: 0
+  scheduler: none
+
+evaluation:
+  candidate_library: train_test_union
+  expected_candidate_count: 38502
+  truth_mode: direction_invariant
+  reverse_complement_ensemble: true
+  query_batch_size: 64
+  primary_metric: novel_dna_recall_at_10
+  recall_ks: [1, 5, 10]
+  recall_curve_max_k: 50
+  selection_tiebreak:
+    - novel_dna_recall_at_10
+    - novel_dna_mrr
+    - novel_dna_median_rank
+    - recall_at_10
+    - earlier_epoch
+  report_novel_dna_subset: true
+
+runtime:
+  run_root: runs
+  protein_embedding_cache: embeddings/train_proteins
+  dna_embedding_cache: embeddings/train_dnas
+  train_rc_embedding_cache: embeddings/train_dnas_rc_only
+  test_candidate_embedding_cache: embeddings/test_candidates
+  test_dna_embedding_cache: embeddings/test_dnas
+  test_query_rc_embedding_cache: embeddings/test_queries_rc_only
+  device: cuda

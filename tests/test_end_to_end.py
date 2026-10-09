@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import copy
 import json
 from pathlib import Path
 
@@ -162,3 +163,46 @@ def test_synthetic_training_checkpoint_index_and_screen(tmp_path: Path) -> None:
     assert (full_output / "comparison.tsv").exists()
     assert (full_output / "evaluation_scope.json").exists()
     assert (full_output / full_results[0]["label"] / "metrics.json").exists()
+
+    v11_config = copy.deepcopy(config)
+    v11_config["training"].update(
+        {
+            "epochs": 1,
+            "ranking_loss_weight": 0.25,
+            "ranking_margin": 0.1,
+            "reverse_complement_augmentation_fraction": 1.0,
+        }
+    )
+    v11_config["evaluation"].update(
+        {
+            "candidate_library": "train_test_union",
+            "truth_mode": "direction_invariant",
+            "reverse_complement_ensemble": True,
+            "query_batch_size": 2,
+            "primary_metric": "recall_at_10",
+            "selection_tiebreak": [
+                "recall_at_10",
+                "mrr",
+                "median_rank",
+                "earlier_epoch",
+            ],
+        }
+    )
+    v11_config["runtime"].update(
+        {
+            "run_root": str(tmp_path / "runs_v11"),
+            "test_candidate_embedding_cache": str(full_eval_test_cache),
+        }
+    )
+    v11_run = train(v11_config, torch.device("cpu"))
+    v11_history = list(csv.DictReader((v11_run / "logs" / "history.csv").open()))
+    assert float(v11_history[-1]["train_ranking_triplets"]) > 0
+    assert float(v11_history[-1]["train_rc_augmentation_fraction"]) == 1.0
+    assert float(v11_history[-1]["train_rc_added_pairs"]) > 0
+    v11_best = json.loads((v11_run / "evaluation" / "best_metrics.json").read_text())
+    assert v11_best["metrics"]["candidates"] == 2
+    assert "exact_recall_at_10" in v11_best["metrics"]
+    v11_scope = json.loads(
+        (v11_run / "evaluation" / "evaluation_scope.json").read_text()
+    )
+    assert v11_scope["candidate_count"] == 2

@@ -6,6 +6,8 @@ import torch
 
 from rec_rank.evaluation import dense_rank_descending, evaluate_score_matrix, export_dense_topk
 from rec_rank.model import RecRankModel
+from rec_rank.sampler import SampledPair
+from rec_rank.training import _augment_training_batch, _is_better, explicit_ranking_loss
 from rec_rank.utils import read_tsv
 
 
@@ -56,3 +58,55 @@ def test_dense_rank_preserves_all_ties_and_multi_positive(tmp_path: Path) -> Non
     )
     exported = list(read_tsv(export_path))
     assert [row["protein_key"] for row in exported] == ["P1", "P2"]
+
+
+def test_explicit_ranking_loss_and_novel_checkpoint_selection() -> None:
+    batch = [
+        SampledPair("P1", "D1", 1, "attP_pos", 0),
+        SampledPair("P1", "D2", 0, "attP_neg", 0),
+        SampledPair("P2", "D3", 1, "attB_pos", 1),
+        SampledPair("P2", "D4", 0, "attB_neg", 1),
+    ]
+    cosine = torch.tensor([0.7, 0.6, 0.2, 0.5], requires_grad=True)
+    loss, triplets, active_fraction = explicit_ranking_loss(cosine, batch, margin=0.2)
+    assert triplets == 2
+    assert torch.isclose(loss, torch.tensor(0.3))
+    assert active_fraction == 1.0
+    loss.backward()
+    assert cosine.grad is not None
+
+    rc_map = {"D1": "R1", "D2": "R2", "D3": "R3", "D4": "R4"}
+    first = _augment_training_batch(batch, rc_map, 0.5, seed=42, epoch=3)
+    second = _augment_training_batch(batch, rc_map, 0.5, seed=42, epoch=3)
+    assert first == second
+    augmented_batch, dna_keys, added = _augment_training_batch(
+        batch, rc_map, 1.0, seed=42, epoch=3
+    )
+    assert len(augmented_batch) == 2 * len(batch)
+    assert dna_keys[: len(batch)] == [pair.dna_key for pair in batch]
+    assert dna_keys[len(batch) :] == [rc_map[pair.dna_key] for pair in batch]
+    assert added == len(batch)
+
+    best = {
+        "epoch": 2,
+        "metrics": {
+            "novel_dna_recall_at_10": 0.1,
+            "novel_dna_mrr": 0.2,
+            "novel_dna_median_rank": 20,
+            "recall_at_10": 0.3,
+        },
+    }
+    candidate = {
+        "novel_dna_recall_at_10": 0.2,
+        "novel_dna_mrr": 0.1,
+        "novel_dna_median_rank": 100,
+        "recall_at_10": 0.2,
+    }
+    order = [
+        "novel_dna_recall_at_10",
+        "novel_dna_mrr",
+        "novel_dna_median_rank",
+        "recall_at_10",
+        "earlier_epoch",
+    ]
+    assert _is_better(candidate, 3, best, order)

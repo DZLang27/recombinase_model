@@ -3,7 +3,7 @@ from __future__ import annotations
 import csv
 from pathlib import Path
 
-from rec_rank.data import normalize_dna, prepare_data, stable_key
+from rec_rank.data import normalize_dna, prepare_data, reverse_complement, stable_key
 from rec_rank.sampler import EpochBatchSampler, sample_group
 
 
@@ -74,6 +74,9 @@ def test_prepare_removes_only_conflicting_pair(tmp_path: Path) -> None:
     assert summary["test_unique_queries"] == 2
     conflict = (tmp_path / "processed" / "train_conflicts.tsv").read_text()
     assert stable_key("AAAA", "dna") in conflict
+    rc_map = (tmp_path / "processed" / "train_dnas_rc_map.tsv").read_text()
+    assert stable_key(reverse_complement("CCCC"), "dna") in rc_map
+    assert (tmp_path / "processed" / "test_queries_rc_only.tsv").exists()
 
 
 def test_sampler_rotates_and_avoids_duplicate_pair() -> None:

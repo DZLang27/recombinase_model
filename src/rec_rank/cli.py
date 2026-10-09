@@ -32,7 +32,7 @@ def _load_config(path: str) -> dict[str, Any]:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="rec-rank",
-        description="RecRank V1：输入 DNA，在候选重组酶库中做 cosine dense ranking。",
+        description="RecRank：输入 DNA，在候选重组酶库中做 cosine dense ranking。",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -58,7 +58,9 @@ def build_parser() -> argparse.ArgumentParser:
     trust_group.add_argument("--trust-remote-code", action="store_true", default=None)
     trust_group.add_argument("--no-trust-remote-code", action="store_false", dest="trust_remote_code")
 
-    train_parser = subparsers.add_parser("train", help="训练投影头并每 epoch 做完整测试检索")
+    train_parser = subparsers.add_parser(
+        "train", help="训练投影头并按配置在每个 epoch 做候选库检索评价"
+    )
     _add_config(train_parser)
     train_parser.add_argument("--device")
     train_parser.add_argument("--run-dir")
@@ -93,6 +95,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--test-candidate-embeddings", default="embeddings/test_candidates"
     )
     full_evaluate_parser.add_argument("--query-embeddings", default="embeddings/test_dnas")
+    full_evaluate_parser.add_argument("--query-rc-embeddings")
     full_evaluate_parser.add_argument("--processed-dir", default="data/processed")
     full_evaluate_parser.add_argument("--output", required=True)
     full_evaluate_parser.add_argument("--device", default="cuda")
@@ -206,6 +209,7 @@ def main(argv: list[str] | None = None) -> None:
             device=resolve_device(args.device),
             query_batch_size=args.query_batch_size,
             top_k=args.top_k,
+            query_rc_cache=args.query_rc_embeddings,
         )
         compact = [
             {

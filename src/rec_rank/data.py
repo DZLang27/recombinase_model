@@ -141,6 +141,50 @@ def _write_memberships(path: Path, memberships: Iterable[Membership]) -> None:
     write_tsv(path, rows, ["protein_key", "dna_key", "label", "category", "source_rows"])
 
 
+def _write_reverse_complement_inputs(
+    output: Path,
+    prefix: str,
+    source_sequences: dict[str, str],
+    primary_keys: set[str] | None = None,
+) -> dict[str, int]:
+    """写出方向映射，以及主 cache 中不存在、需要额外编码的反向互补序列。"""
+    source_keys = primary_keys if primary_keys is not None else set(source_sequences)
+    supplement: dict[str, str] = {}
+    mapping_rows = []
+    palindrome_count = 0
+    for dna_key in sorted(source_sequences):
+        rc_sequence = reverse_complement(source_sequences[dna_key])
+        rc_key = stable_key(rc_sequence, "dna")
+        palindrome_count += int(rc_key == dna_key)
+        if rc_key not in source_keys:
+            supplement[rc_key] = rc_sequence
+        mapping_rows.append(
+            {
+                "dna_key": dna_key,
+                "reverse_complement_dna_key": rc_key,
+                "reverse_complement_in_primary_cache": int(rc_key in source_keys),
+            }
+        )
+    write_tsv(
+        output / f"{prefix}_rc_map.tsv",
+        mapping_rows,
+        ["dna_key", "reverse_complement_dna_key", "reverse_complement_in_primary_cache"],
+    )
+    write_tsv(
+        output / f"{prefix}_rc_only.tsv",
+        (
+            {"dna_key": key, "sequence": supplement[key]}
+            for key in sorted(supplement)
+        ),
+        ["dna_key", "sequence"],
+    )
+    return {
+        f"{prefix}_rc_mapping_count": len(mapping_rows),
+        f"{prefix}_rc_only_count": len(supplement),
+        f"{prefix}_palindrome_count": palindrome_count,
+    }
+
+
 def prepare_data(train_path: str | Path, test_path: str | Path, output_dir: str | Path) -> dict[str, Any]:
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
@@ -171,6 +215,11 @@ def prepare_data(train_path: str | Path, test_path: str | Path, output_dir: str 
         output / "train_dnas.tsv",
         ({"dna_key": key, "sequence": train["dna_sequences"][key]} for key in sorted(supervised_train_dnas)),
         ["dna_key", "sequence"],
+    )
+    train_rc_summary = _write_reverse_complement_inputs(
+        output,
+        "train_dnas",
+        {key: train["dna_sequences"][key] for key in supervised_train_dnas},
     )
     _write_memberships(output / "train_pairs.tsv", train_memberships)
 
@@ -282,6 +331,12 @@ def prepare_data(train_path: str | Path, test_path: str | Path, output_dir: str 
         ],
     )
     write_tsv(output / "test_truth.tsv", truth_rows, ["dna_key", "positive_protein_keys"])
+    test_query_rc_summary = _write_reverse_complement_inputs(
+        output,
+        "test_queries",
+        {row["dna_key"]: row["sequence"] for row in query_rows},
+        primary_keys=test_labeled_dnas,
+    )
 
     train_unique_pairs = {(item.protein_key, item.dna_key) for item in train_memberships}
     test_unique_pairs = {(item.protein_key, item.dna_key) for item in test_memberships}
@@ -318,6 +373,8 @@ def prepare_data(train_path: str | Path, test_path: str | Path, output_dir: str 
         "test_query_direction_independent_overlap": sum(
             row["direction_seen_in_train_positive"] for row in query_rows
         ),
+        **train_rc_summary,
+        **test_query_rc_summary,
         "test_novel_dna_queries": sum(row["is_novel_dna"] for row in query_rows),
     }
     atomic_json_dump(output / "summary.json", summary)

@@ -9,7 +9,7 @@ from typing import Any
 import numpy as np
 import torch
 
-from .utils import atomic_json_dump, atomic_write_text, read_tsv
+from .utils import atomic_json_dump, atomic_write_text, load_yaml, read_tsv
 
 
 def _load_history(path: Path) -> list[dict[str, Any]]:
@@ -54,6 +54,10 @@ def generate_report(run_dir: str | Path) -> list[Path]:
     epochs = _series(history, "epoch")
     best = json.loads((run / "evaluation" / "best_metrics.json").read_text(encoding="utf-8"))
     best_epoch = int(best["epoch"])
+    config = load_yaml(run / "resolved_config.yaml")
+    evaluation_cfg = config.get("evaluation", {})
+    full_library = evaluation_cfg.get("candidate_library") == "train_test_union"
+    primary_metric = evaluation_cfg.get("primary_metric", "recall_at_10")
     generated: list[Path] = []
 
     def save(fig: Any, name: str) -> None:
@@ -64,10 +68,12 @@ def generate_report(run_dir: str | Path) -> list[Path]:
         generated.append(path)
 
     fig, ax = plt.subplots(figsize=(8, 5))
-    ax.plot(epochs, _series(history, "train_loss"), label="train BCE")
+    ax.plot(epochs, _series(history, "train_loss"), label="train combined loss")
+    if "train_bce_loss" in history[-1]:
+        ax.plot(epochs, _series(history, "train_bce_loss"), label="train BCE")
     ax.plot(epochs, _series(history, "test_loss"), label="test BCE")
     ax.axvline(best_epoch, color="black", linestyle="--", alpha=0.5, label=f"best={best_epoch}")
-    ax.set(xlabel="Epoch", ylabel="BCE loss", title="Training and test labeled-pair loss")
+    ax.set(xlabel="Epoch", ylabel="Loss", title="Training objective and labeled-pair BCE")
     ax.legend()
     ax.grid(alpha=0.25)
     save(fig, "loss_curves.png")
@@ -78,12 +84,27 @@ def generate_report(run_dir: str | Path) -> list[Path]:
         values = _series(history, f"recall_at_{k}")
         recall_values.extend(values[np.isfinite(values)].tolist())
         ax.plot(epochs, values, label=f"Recall@{k}")
+    novel_recall = _series(history, "novel_dna_recall_at_10")
+    if np.isfinite(novel_recall).any():
+        recall_values.extend(novel_recall[np.isfinite(novel_recall)].tolist())
+        ax.plot(
+            epochs,
+            novel_recall,
+            color="black",
+            linewidth=2,
+            linestyle=":",
+            label="Novel-DNA Recall@10 (selection)",
+        )
     ax.axvline(best_epoch, color="black", linestyle="--", alpha=0.5)
     recall_upper = max(0.05, min(1.0, max(recall_values, default=0.05) * 1.2))
     ax.set(
         ylabel="Recall",
         ylim=(0, recall_upper),
-        title="Exact-protein retrieval recall",
+        title=(
+            "Full-library direction-invariant retrieval recall"
+            if full_library
+            else "Exact-protein retrieval recall"
+        ),
     )
     ax.set_xlabel("Epoch", loc="center")
     ax.legend()
@@ -94,6 +115,18 @@ def generate_report(run_dir: str | Path) -> list[Path]:
     right = left.twinx()
     left.plot(epochs, _series(history, "mrr"), color="tab:blue", label="MRR")
     right.plot(epochs, _series(history, "median_rank"), color="tab:orange", label="Median rank")
+    novel_mrr = _series(history, "novel_dna_mrr")
+    novel_median = _series(history, "novel_dna_median_rank")
+    if np.isfinite(novel_mrr).any():
+        left.plot(epochs, novel_mrr, color="tab:blue", linestyle=":", label="Novel MRR")
+    if np.isfinite(novel_median).any():
+        right.plot(
+            epochs,
+            novel_median,
+            color="tab:orange",
+            linestyle=":",
+            label="Novel median rank",
+        )
     left.axvline(best_epoch, color="black", linestyle="--", alpha=0.5)
     left.set(xlabel="Epoch", ylabel="MRR", title="Retrieval rank metrics")
     right.set_ylabel("Median dense rank")
@@ -151,6 +184,37 @@ def generate_report(run_dir: str | Path) -> list[Path]:
     ax.grid(alpha=0.25)
     save(fig, "cosine_and_margin.png")
 
+    training_cfg = config.get("training", {})
+    if float(training_cfg.get("ranking_loss_weight", 0.0)) > 0 or float(
+        training_cfg.get("reverse_complement_augmentation_fraction", 0.0)
+    ) > 0:
+        fig, left = plt.subplots(figsize=(8, 5))
+        right = left.twinx()
+        left.plot(epochs, _series(history, "train_ranking_loss"), label="ranking loss")
+        left.plot(
+            epochs,
+            _series(history, "train_ranking_active_fraction"),
+            label="active ranking fraction",
+        )
+        right.plot(
+            epochs,
+            _series(history, "train_rc_augmentation_fraction"),
+            color="tab:green",
+            linestyle="--",
+            label="RC additions / originals",
+        )
+        left.axvline(best_epoch, color="black", linestyle="--", alpha=0.5)
+        left.set(
+            xlabel="Epoch",
+            ylabel="Ranking loss / active fraction",
+            title="V1.1 ranking and orientation augmentation",
+        )
+        right.set_ylabel("Added RC copies / original samples")
+        left.legend(loc="upper left")
+        right.legend(loc="upper right")
+        left.grid(alpha=0.25)
+        save(fig, "ranking_and_rc.png")
+
     last_epoch = int(max(epochs))
     middle_epoch = last_epoch // 2
     distribution_epochs = list(dict.fromkeys([0, middle_epoch, best_epoch]))
@@ -192,11 +256,15 @@ def generate_report(run_dir: str | Path) -> list[Path]:
     ax.legend()
     save(fig, "recall_at_k.png")
 
+    model_version = "V1.1" if full_library else "V1"
     report_lines = [
-        f"# RecRank V1 run report: {run.name}",
+        f"# RecRank {model_version} run report: {run.name}",
         "",
         f"- Best epoch: {best_epoch}",
+        f"- Checkpoint selection metric: {primary_metric}",
+        f"- Candidate library: {'train+test protein union' if full_library else 'test-only'}",
         f"- Recall@10: {best['metrics']['recall_at_10']:.6f}",
+        f"- Novel-DNA Recall@10: {best['metrics'].get('novel_dna_recall_at_10', float('nan')):.6f}",
         f"- MRR: {best['metrics']['mrr']:.6f}",
         f"- Median dense rank: {best['metrics']['median_rank']:.3f}",
         "- 注意：本轮实验按既定方案使用测试集逐 epoch 选 best，因此这些数值不是未触碰测试集上的无偏最终估计。",

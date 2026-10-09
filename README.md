@@ -201,3 +201,54 @@ pytest
 ```
 
 测试覆盖数据清洗与冲突移除、轮换 sampler、正值 `gamma`、梯度可学习性、dense ties、多正样本指标，以及 synthetic embedding 下的训练→best checkpoint→index→screening 全链路。Synthetic 测试只验证工程链路，不能作为模型性能结果。
+
+## V1.1：完整候选库、排序损失与方向增强
+
+V1.1 保留双塔与纯 cosine 检索，不增加局部识别区域或交互精排器。相对 V1
+只做四项受控改变：
+
+- 每个 epoch 都在训练集与测试集蛋白去重并集上评价，不再把 1,287 个测试蛋白
+  的结果作为主指标；当前完整候选库为 38,502 条蛋白。
+- best checkpoint 首先按 `novel_dna_recall_at_10` 选择，再依次比较 novel-DNA
+  MRR、novel-DNA median rank、全体 Recall@10 和更早 epoch。
+- 训练目标为 `BCE + 0.25 × margin ranking loss`。ranking pair 只来自同一蛋白下
+  明确标注的正、负 DNA；unknown 组合不会被构造成负样本。
+- 训练时保留全部原始样本，并为每一条样本额外追加反向互补副本；副本继承
+  原标签，因此每个 epoch 的训练实例为原来的 2 倍。逐 epoch 检索将正向
+  与反向互补的投影向量相加后重新 L2 归一化。主 truth 同样按方向不变口径合并，
+  exact truth 指标仍作为诊断项记录。
+
+先重新运行数据准备，生成反向互补映射和仅需补算的序列：
+
+```bash
+rec-rank prepare --config configs/v1_1.yaml
+```
+
+新增文件为 `train_dnas_rc_map.tsv`、`train_dnas_rc_only.tsv`、
+`test_queries_rc_map.tsv` 和 `test_queries_rc_only.tsv`。当前实际需补算 165,991 条
+训练 DNA 与 3,002 条测试 query DNA：
+
+```bash
+sbatch scripts/slurm_precompute.sh dna \
+  data/processed/train_dnas_rc_only.tsv embeddings/train_dnas_rc_only
+
+sbatch scripts/slurm_precompute.sh dna \
+  data/processed/test_queries_rc_only.tsv embeddings/test_queries_rc_only
+```
+
+两个 embedding 任务完成后训练 V1.1：
+
+```bash
+sbatch --export=ALL,SEED=42 scripts/slurm_train_v1_1.sh
+```
+
+也可以用依赖关系一次提交，避免训练任务提前启动：
+
+```bash
+TRAIN_RC_JOB=$(sbatch --parsable scripts/slurm_precompute.sh dna \
+  data/processed/train_dnas_rc_only.tsv embeddings/train_dnas_rc_only)
+TEST_RC_JOB=$(sbatch --parsable scripts/slurm_precompute.sh dna \
+  data/processed/test_queries_rc_only.tsv embeddings/test_queries_rc_only)
+sbatch --dependency=afterok:${TRAIN_RC_JOB}:${TEST_RC_JOB} \
+  --export=ALL,SEED=42 scripts/slurm_train_v1_1.sh
+```

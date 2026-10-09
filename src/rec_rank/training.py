@@ -1,8 +1,5 @@
 from __future__ import annotations
 
-import csv
-import json
-import os
 import platform
 import random
 import signal
@@ -10,14 +7,14 @@ import sys
 import time
 from collections import defaultdict
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 import numpy as np
 import torch
 from torch.nn import functional as F
 
 from .data import load_groups
-from .embeddings import EmbeddingStore, load_embedding_store
+from .embeddings import EmbeddingStore, load_embedding_store, merge_embedding_stores
 from .evaluation import (
     RetrievalEvaluation,
     evaluate_score_matrix,
@@ -28,7 +25,14 @@ from .evaluation import (
     recall_curve,
 )
 from .model import RecRankModel
+from .model_io import load_checkpoint, project_store
 from .sampler import EpochBatchSampler
+from .full_library import (
+    _build_truths,
+    _candidate_metadata,
+    _merge_candidate_stores,
+    evaluate_model_full_library,
+)
 from .utils import (
     append_csv,
     append_jsonl,
@@ -50,6 +54,12 @@ HISTORY_FIELDS = [
     "epoch",
     "global_step",
     "train_loss",
+    "train_bce_loss",
+    "train_ranking_loss",
+    "train_ranking_active_fraction",
+    "train_ranking_triplets",
+    "train_rc_augmentation_fraction",
+    "train_rc_added_pairs",
     "train_positive_loss",
     "train_negative_loss",
     "train_positive_cosine_mean",
@@ -66,6 +76,9 @@ HISTORY_FIELDS = [
     "test_negative_loss",
     "test_positive_cosine_mean",
     "test_negative_cosine_mean",
+    "queries",
+    "candidates",
+    "novel_dna_queries",
     "recall_at_1",
     "recall_at_5",
     "recall_at_10",
@@ -74,6 +87,8 @@ HISTORY_FIELDS = [
     "novel_dna_recall_at_10",
     "novel_dna_mrr",
     "novel_dna_median_rank",
+    "exact_recall_at_10",
+    "exact_novel_dna_recall_at_10",
     "gamma",
     "bias",
     "projection_lr",
@@ -125,16 +140,6 @@ def _restore_rng_state(state: dict[str, Any]) -> None:
         torch.cuda.set_rng_state_all(state["cuda"])
 
 
-def load_checkpoint(path: str | Path, device: torch.device | str = "cpu") -> dict[str, Any]:
-    return torch.load(path, map_location=device, weights_only=False)
-
-
-def model_from_checkpoint(checkpoint: dict[str, Any], device: torch.device) -> RecRankModel:
-    model = RecRankModel(**checkpoint["model_architecture"])
-    model.load_state_dict(checkpoint["model_state"])
-    return model.to(device)
-
-
 def _build_checkpoint(
     model: RecRankModel,
     optimizer: torch.optim.Optimizer,
@@ -165,44 +170,94 @@ def _build_checkpoint(
     }
 
 
-def _is_better(metrics: dict[str, Any], epoch: int, best: dict[str, Any] | None) -> bool:
+def _selection_key(
+    metrics: dict[str, Any], epoch: int, selection_tiebreak: list[str]
+) -> tuple[float, ...]:
+    values: list[float] = []
+    for name in selection_tiebreak:
+        if name == "earlier_epoch":
+            values.append(-float(epoch))
+            continue
+        if name not in metrics:
+            raise KeyError(f"checkpoint 选择指标不存在: {name}")
+        value = float(metrics[name])
+        if "rank" in name and "recall" not in name:
+            value = -value
+        values.append(value)
+    return tuple(values)
+
+
+def _is_better(
+    metrics: dict[str, Any],
+    epoch: int,
+    best: dict[str, Any] | None,
+    selection_tiebreak: list[str] | None = None,
+) -> bool:
     if best is None:
         return True
-    candidate_key = (
-        float(metrics["recall_at_10"]),
-        float(metrics["mrr"]),
-        -float(metrics["median_rank"]),
-        -epoch,
+    order = selection_tiebreak or ["recall_at_10", "mrr", "median_rank", "earlier_epoch"]
+    return _selection_key(metrics, epoch, order) > _selection_key(
+        best["metrics"], int(best["epoch"]), order
     )
-    best_metrics = best["metrics"]
-    best_key = (
-        float(best_metrics["recall_at_10"]),
-        float(best_metrics["mrr"]),
-        -float(best_metrics["median_rank"]),
-        -int(best["epoch"]),
-    )
-    return candidate_key > best_key
 
 
-def _project_store(
-    model: RecRankModel,
-    store: EmbeddingStore,
-    keys: list[str],
-    modality: str,
-    device: torch.device,
-    batch_size: int = 4096,
-) -> torch.Tensor:
-    outputs = []
-    model.eval()
-    with torch.inference_mode():
-        for start in range(0, len(keys), batch_size):
-            batch_keys = keys[start : start + batch_size]
-            values = store.rows(batch_keys, device=device).float()
-            projected = (
-                model.project_proteins(values) if modality == "protein" else model.project_dnas(values)
-            )
-            outputs.append(projected.float().cpu())
-    return torch.cat(outputs, dim=0)
+def explicit_ranking_loss(
+    cosine: torch.Tensor,
+    batch: list[Any],
+    margin: float,
+) -> tuple[torch.Tensor, int, float]:
+    """只比较同一蛋白内有明确正/负标签的样本，不把 unknown 当负样本。"""
+    by_group: dict[int, dict[int, list[int]]] = defaultdict(lambda: {0: [], 1: []})
+    for index, pair in enumerate(batch):
+        by_group[pair.group_index][pair.label].append(index)
+    violations: list[torch.Tensor] = []
+    for labels in by_group.values():
+        for positive_index in labels[1]:
+            for negative_index in labels[0]:
+                violations.append(
+                    F.relu(margin - cosine[positive_index] + cosine[negative_index])
+                )
+    if not violations:
+        return cosine.sum() * 0.0, 0, 0.0
+    stacked = torch.stack(violations)
+    active_fraction = float((stacked.detach() > 0).float().mean().cpu())
+    return stacked.mean(), len(violations), active_fraction
+
+
+def _load_rc_map(path: Path) -> dict[str, str]:
+    mapping = {
+        row["dna_key"]: row["reverse_complement_dna_key"] for row in read_tsv(path)
+    }
+    if not mapping:
+        raise ValueError(f"反向互补映射为空: {path}")
+    return mapping
+
+
+def _augment_training_batch(
+    batch: list[Any], rc_map: dict[str, str], fraction: float, seed: int, epoch: int
+) -> tuple[list[Any], list[str], int]:
+    """保留全部原样本，并为确定性选中的样本追加反向互补副本。"""
+    if not 0.0 <= fraction <= 1.0:
+        raise ValueError("reverse_complement_augmentation_fraction 必须在 [0, 1]")
+    augmented_batch = list(batch)
+    dna_keys = [pair.dna_key for pair in batch]
+    rc_count = 0
+    cutoff = int(fraction * (2**64 - 1))
+    for pair in batch:
+        use_rc = fraction == 1.0
+        if 0.0 < fraction < 1.0:
+            token = f"{seed}:{epoch}:{pair.protein_key}:{pair.dna_key}:{pair.category}"
+            use_rc = int(sha256_text(token)[:16], 16) <= cutoff
+        if use_rc:
+            # SampledPair 保留原 dna_key，确保 pair coverage 仍以原始监督关系计数；
+            # 真正送入模型的 DNA embedding key 使用对应的反向互补 key。
+            augmented_batch.append(pair)
+            dna_keys.append(rc_map[pair.dna_key])
+            rc_count += 1
+    return augmented_batch, dna_keys, rc_count
+
+
+_project_store = project_store
 
 
 def _load_pairs(path: str | Path) -> list[tuple[str, str, float]]:
@@ -317,6 +372,25 @@ def _write_epoch_artifacts(
     )
 
 
+def _export_full_top_rows(path: Path, rows: list[dict[str, Any]]) -> None:
+    write_tsv(
+        path,
+        rows,
+        [
+            "query_id",
+            "query_sequence",
+            "protein_key",
+            "protein_record_ids",
+            "protein_cluster_ids",
+            "candidate_source",
+            "cosine",
+            "dense_rank",
+            "checkpoint_id",
+            "candidate_library_id",
+        ],
+    )
+
+
 def _log_tensorboard(writer: Any, row: dict[str, Any], epoch: int) -> None:
     for key, value in row.items():
         if key in {"epoch", "is_best"} or value in {"", None}:
@@ -326,6 +400,7 @@ def _log_tensorboard(writer: Any, row: dict[str, Any], epoch: int) -> None:
 
 
 def _runtime_manifest(config: dict[str, Any], fingerprints: dict[str, Any], run_id: str) -> dict[str, Any]:
+    evaluation = config["evaluation"]
     return {
         "run_id": run_id,
         "created_at": utc_now_iso(),
@@ -337,6 +412,12 @@ def _runtime_manifest(config: dict[str, Any], fingerprints: dict[str, Any], run_
         "seed": config["training"]["seed"],
         "config_sha256": sha256_text(canonical_json(config)),
         "fingerprints": fingerprints,
+        "primary_metric": evaluation.get("primary_metric", "recall_at_10"),
+        "candidate_library": evaluation.get("candidate_library", "test_only"),
+        "truth_mode": evaluation.get("truth_mode", "exact"),
+        "reverse_complement_ensemble": bool(
+            evaluation.get("reverse_complement_ensemble", False)
+        ),
         "test_usage_notice": "测试集在本项目决策中用于逐 epoch 模型选择，因此不是未触碰的最终独立估计。",
     }
 
@@ -365,30 +446,98 @@ def train(
         (run_path / relative).mkdir(parents=True, exist_ok=True)
 
     train_protein_store = load_embedding_store(runtime_cfg["protein_embedding_cache"])
-    train_dna_store = load_embedding_store(runtime_cfg["dna_embedding_cache"])
-    candidate_store = load_embedding_store(runtime_cfg["test_candidate_embedding_cache"])
+    train_dna_primary_store = load_embedding_store(runtime_cfg["dna_embedding_cache"])
+    test_candidate_store = load_embedding_store(runtime_cfg["test_candidate_embedding_cache"])
     test_dna_store = load_embedding_store(runtime_cfg["test_dna_embedding_cache"])
+
+    rc_augmentation_fraction = float(
+        training_cfg.get("reverse_complement_augmentation_fraction", 0.0)
+    )
+    train_rc_map: dict[str, str] | None = None
+    train_dna_store = train_dna_primary_store
+    if rc_augmentation_fraction > 0:
+        train_rc_map = _load_rc_map(processed / "train_dnas_rc_map.tsv")
+        missing_rc_keys = sorted(set(train_rc_map.values()) - set(train_dna_primary_store.keys))
+        if missing_rc_keys:
+            rc_store = load_embedding_store(runtime_cfg["train_rc_embedding_cache"])
+            if not rc_store.contains_all(missing_rc_keys):
+                raise ValueError("训练反向互补 embedding cache 不完整")
+            train_dna_store = merge_embedding_stores(
+                [train_dna_primary_store, rc_store], ["train_dna", "train_dna_rc"]
+            )
+
+    full_library_mode = evaluation_cfg.get("candidate_library") == "train_test_union"
+    if full_library_mode:
+        candidate_store, candidate_audit = _merge_candidate_stores(
+            runtime_cfg["protein_embedding_cache"],
+            runtime_cfg["test_candidate_embedding_cache"],
+        )
+        (
+            query_keys,
+            exact_truth,
+            direction_truth,
+            query_metadata,
+            truth_audit,
+        ) = _build_truths(processed)
+        truth_mode = str(evaluation_cfg.get("truth_mode", "direction_invariant"))
+        if truth_mode not in {"exact", "direction_invariant"}:
+            raise ValueError("evaluation.truth_mode 必须是 exact 或 direction_invariant")
+        truth = exact_truth if truth_mode == "exact" else direction_truth
+        candidate_metadata = _candidate_metadata(processed)
+        if set(candidate_store.keys) != set(candidate_metadata):
+            raise ValueError("完整候选 embedding 与蛋白元数据的 key 集合不一致")
+    else:
+        candidate_store = test_candidate_store
+        truth = load_truth(processed / "test_truth.tsv")
+        exact_truth = truth
+        direction_truth = truth
+        query_metadata = load_query_metadata(processed / "test_queries.tsv")
+        query_keys = list(truth)
+        candidate_metadata = {
+            row["protein_key"]: row for row in read_tsv(processed / "test_candidates.tsv")
+        }
+        candidate_audit = {"scope": "test_only", "count": len(candidate_store.keys)}
+        truth_audit = {"scope": "test_truth_only"}
+
+    expected_candidate_count = evaluation_cfg.get("expected_candidate_count")
+    if expected_candidate_count is not None and len(candidate_store.keys) != int(
+        expected_candidate_count
+    ):
+        raise ValueError(
+            "候选库数量不符合配置："
+            f"expected={expected_candidate_count}, actual={len(candidate_store.keys)}"
+        )
+
+    query_rc_map: dict[str, str] | None = None
+    query_eval_store = test_dna_store
+    if bool(evaluation_cfg.get("reverse_complement_ensemble", False)):
+        query_rc_map = _load_rc_map(processed / "test_queries_rc_map.tsv")
+        missing_query_rc = sorted(set(query_rc_map.values()) - set(test_dna_store.keys))
+        if missing_query_rc:
+            query_rc_only = load_embedding_store(runtime_cfg["test_query_rc_embedding_cache"])
+            if not query_rc_only.contains_all(missing_query_rc):
+                raise ValueError("测试 query 反向互补 embedding cache 不完整")
+            query_eval_store = merge_embedding_stores(
+                [test_dna_store, query_rc_only], ["test_dna", "test_query_rc"]
+            )
     fingerprints = {
         "train_groups_sha256": sha256_file(processed / "train_groups.jsonl"),
         "test_truth_sha256": sha256_file(processed / "test_truth.tsv"),
         "train_protein_cache": train_protein_store.manifest,
-        "train_dna_cache": train_dna_store.manifest,
-        "test_candidate_cache": candidate_store.manifest,
+        "train_dna_cache": train_dna_primary_store.manifest,
+        "test_candidate_cache": test_candidate_store.manifest,
         "test_dna_cache": test_dna_store.manifest,
+        "training_dna_union": train_dna_store.manifest,
+        "candidate_library": candidate_store.manifest,
+        "evaluation_query_union": query_eval_store.manifest,
+        "candidate_audit": candidate_audit,
+        "truth_audit": truth_audit,
     }
 
     groups = load_groups(processed / "train_groups.jsonl")
     sampler = EpochBatchSampler(groups, int(training_cfg["proteins_per_batch"]), seed)
     test_pairs = _load_pairs(processed / "test_pairs.tsv")
-    truth = load_truth(processed / "test_truth.tsv")
-    query_metadata = load_query_metadata(processed / "test_queries.tsv")
-    query_keys = list(truth)
     candidate_keys = candidate_store.keys
-    candidate_metadata = {
-        row["protein_key"]: row for row in read_tsv(processed / "test_candidates.tsv")
-    }
-    if set(candidate_keys) != set(candidate_metadata):
-        raise ValueError("test candidate embedding cache 与 prepared candidate 集合不一致")
     if not test_dna_store.contains_all(query_keys):
         raise ValueError("test DNA embedding cache 缺少 retrieval query")
 
@@ -399,7 +548,7 @@ def train(
     if train_dna_store.embeddings.shape[1] != dna_dim:
         raise ValueError("DNA embedding 维度与配置不一致")
     for train_store, test_store, label in (
-        (train_protein_store, candidate_store, "protein"),
+        (train_protein_store, test_candidate_store, "protein"),
         (train_dna_store, test_dna_store, "DNA"),
     ):
         for field in ("model", "resolved_revision", "pooling", "normalization_version"):
@@ -478,6 +627,24 @@ def train(
     else:
         dump_yaml(run_path / "resolved_config.yaml", config)
         atomic_json_dump(run_path / "manifest.json", _runtime_manifest(config, fingerprints, run_path.name))
+        atomic_json_dump(
+            run_path / "evaluation" / "evaluation_scope.json",
+            {
+                "candidate_library": candidate_audit,
+                "truth": truth_audit,
+                "candidate_count": len(candidate_keys),
+                "query_count": len(query_keys),
+                "novel_dna_query_count": sum(
+                    int(query_metadata[key].get("is_novel_dna", "0"))
+                    for key in query_keys
+                ),
+                "primary_metric": evaluation_cfg.get("primary_metric", "recall_at_10"),
+                "truth_mode": evaluation_cfg.get("truth_mode", "exact"),
+                "reverse_complement_ensemble": bool(
+                    evaluation_cfg.get("reverse_complement_ensemble", False)
+                ),
+            },
+        )
         atomic_json_dump(run_path / "status.json", {"status": "running", "updated_at": utc_now_iso()})
 
     try:
@@ -486,6 +653,87 @@ def train(
         raise RuntimeError("缺少 tensorboard；请在 rec_rank 环境安装 requirements.txt") from exc
     writer = SummaryWriter(log_dir=run_path / "logs" / "tensorboard", purge_step=start_epoch if resume else None)
     recall_ks = tuple(int(value) for value in evaluation_cfg["recall_ks"])
+    selection_tiebreak = list(
+        evaluation_cfg.get(
+            "selection_tiebreak",
+            [evaluation_cfg.get("primary_metric", "recall_at_10"), "mrr", "median_rank", "earlier_epoch"],
+        )
+    )
+    primary_metric = str(evaluation_cfg.get("primary_metric", "recall_at_10"))
+    if not selection_tiebreak or selection_tiebreak[0] != primary_metric:
+        raise ValueError("evaluation.selection_tiebreak 第一项必须等于 primary_metric")
+    query_batch_size = int(evaluation_cfg.get("query_batch_size", 64))
+
+    def run_retrieval() -> tuple[RetrievalEvaluation, torch.Tensor | None, list[dict[str, Any]]]:
+        if not full_library_mode:
+            evaluation, scores = _retrieval_evaluation(
+                model,
+                candidate_store,
+                test_dna_store,
+                query_keys,
+                candidate_keys,
+                truth,
+                query_metadata,
+                device,
+                recall_ks,
+            )
+            return evaluation, scores, []
+        full = evaluate_model_full_library(
+            model=model,
+            candidates=candidate_store,
+            query_store=test_dna_store,
+            query_keys=query_keys,
+            exact_truth=exact_truth,
+            direction_truth=direction_truth,
+            query_metadata=query_metadata,
+            candidate_metadata=candidate_metadata,
+            device=device,
+            recall_ks=recall_ks,
+            query_batch_size=query_batch_size,
+            top_k=10,
+            query_rc_store=query_eval_store if query_rc_map is not None else None,
+            query_rc_map=query_rc_map,
+        )
+        primary_metrics = (
+            full.exact_metrics
+            if evaluation_cfg.get("truth_mode") == "exact"
+            else full.direction_metrics
+        )
+        primary_rows = (
+            full.exact_rows
+            if evaluation_cfg.get("truth_mode") == "exact"
+            else full.direction_rows
+        )
+        metrics = dict(primary_metrics)
+        metrics.update({f"exact_{key}": value for key, value in full.exact_metrics.items()})
+        return RetrievalEvaluation(metrics=metrics, query_rows=primary_rows, ranks=torch.empty(0)), None, full.top_rows
+
+    def export_best_retrieval(
+        evaluation: RetrievalEvaluation,
+        scores: torch.Tensor | None,
+        top_rows: list[dict[str, Any]],
+        checkpoint_sha: str,
+    ) -> None:
+        if full_library_mode:
+            for row in top_rows:
+                row["checkpoint_id"] = checkpoint_sha[:20]
+            _export_full_top_rows(run_path / "evaluation" / "best_dense_top10.tsv", top_rows)
+        else:
+            if scores is None:
+                raise RuntimeError("test-only retrieval 缺少 score matrix")
+            export_dense_topk(
+                run_path / "evaluation" / "best_dense_top10.tsv",
+                scores,
+                evaluation.ranks,
+                query_keys,
+                candidate_keys,
+                10,
+                checkpoint_sha[:20],
+                sha256_text(canonical_json(candidate_store.manifest))[:20],
+                sequences={key: row.get("sequence", "") for key, row in query_metadata.items()},
+                candidate_metadata=candidate_metadata,
+            )
+
     total_unique_pairs = len(
         {
             (group["protein_key"], dna_key)
@@ -509,23 +757,23 @@ def train(
 
     try:
         if not resume:
-            random_metrics = _random_baseline(
-                query_keys, candidate_keys, truth, query_metadata, seed, recall_ks
-            )
+            evaluation0, scores0, top_rows0 = run_retrieval()
+            if full_library_mode:
+                random_metrics = {
+                    key: value
+                    for key, value in evaluation0.metrics.items()
+                    if "random_recall" in key
+                }
+                random_metrics.update(
+                    {"queries": len(query_keys), "candidates": len(candidate_keys)}
+                )
+            else:
+                random_metrics = _random_baseline(
+                    query_keys, candidate_keys, truth, query_metadata, seed, recall_ks
+                )
             atomic_json_dump(run_path / "evaluation" / "random_baseline.json", random_metrics)
-            evaluation0, scores0 = _retrieval_evaluation(
-                model,
-                candidate_store,
-                test_dna_store,
-                query_keys,
-                candidate_keys,
-                truth,
-                query_metadata,
-                device,
-                recall_ks,
-            )
             test_pair_metrics0, test_pos0, test_neg0 = _evaluate_labeled_pairs(
-                model, test_pairs, candidate_store, test_dna_store, device
+                model, test_pairs, test_candidate_store, test_dna_store, device
             )
             row0: dict[str, Any] = {
                 "epoch": 0,
@@ -547,19 +795,7 @@ def train(
             atomic_torch_save(run_path / "checkpoints" / "best.pt", checkpoint0)
             atomic_torch_save(run_path / "checkpoints" / "last.pt", checkpoint0)
             checkpoint0_sha = sha256_file(run_path / "checkpoints" / "best.pt")
-            candidate_space_id = sha256_text(canonical_json(candidate_store.manifest))[:20]
-            export_dense_topk(
-                run_path / "evaluation" / "best_dense_top10.tsv",
-                scores0,
-                evaluation0.ranks,
-                query_keys,
-                candidate_keys,
-                10,
-                checkpoint0_sha[:20],
-                candidate_space_id,
-                sequences={key: row.get("sequence", "") for key, row in query_metadata.items()},
-                candidate_metadata=candidate_metadata,
-            )
+            export_best_retrieval(evaluation0, scores0, top_rows0, checkpoint0_sha)
             atomic_json_dump(run_path / "evaluation" / "best_metrics.json", best)
             export_query_rows(
                 run_path / "evaluation" / "best_query_metrics.tsv", evaluation0.query_rows
@@ -583,7 +819,12 @@ def train(
             if device.type == "cuda":
                 torch.cuda.reset_peak_memory_stats(device)
             model.train()
-            total_loss_sum = 0.0
+            total_bce_loss_sum = 0.0
+            total_ranking_loss_sum = 0.0
+            ranking_triplet_count = 0
+            ranking_active_count = 0.0
+            rc_pair_count = 0
+            original_pair_count = 0
             pair_count = 0
             positive_loss_values: list[float] = []
             negative_loss_values: list[float] = []
@@ -593,14 +834,28 @@ def train(
             gradient_norms: list[float] = []
             clipped_steps = 0
             clip_norm = float(training_cfg["gradient_clip_norm"])
+            ranking_weight = float(training_cfg.get("ranking_loss_weight", 0.0))
+            ranking_margin = float(training_cfg.get("ranking_margin", 0.1))
 
-            for batch in sampler.iter_batches(epoch):
+            for original_batch in sampler.iter_batches(epoch):
                 if stop_requested:
                     break
+                if train_rc_map is not None:
+                    batch, dna_keys, batch_rc_count = _augment_training_batch(
+                        original_batch,
+                        train_rc_map,
+                        rc_augmentation_fraction,
+                        seed,
+                        epoch,
+                    )
+                else:
+                    batch = original_batch
+                    dna_keys = [pair.dna_key for pair in original_batch]
+                    batch_rc_count = 0
                 proteins = train_protein_store.rows(
                     [pair.protein_key for pair in batch], device=device
                 ).float()
-                dnas = train_dna_store.rows([pair.dna_key for pair in batch], device=device).float()
+                dnas = train_dna_store.rows(dna_keys, device=device).float()
                 labels = torch.tensor(
                     [pair.label for pair in batch], device=device, dtype=torch.float32
                 )
@@ -608,7 +863,11 @@ def train(
                 with torch.autocast(
                     device_type=device.type, dtype=torch.bfloat16, enabled=amp_enabled
                 ):
-                    loss, logits, cosine = model.loss(proteins, dnas, labels)
+                    bce_loss, logits, cosine = model.loss(proteins, dnas, labels)
+                    ranking_loss, batch_triplets, batch_active_fraction = explicit_ranking_loss(
+                        cosine, batch, ranking_margin
+                    )
+                    loss = bce_loss + ranking_weight * ranking_loss
                 if not torch.isfinite(loss):
                     raise FloatingPointError(f"epoch {epoch} step {global_step}: loss 为 NaN/Inf")
                 scaler.scale(loss).backward()
@@ -641,35 +900,48 @@ def train(
                     for values in group_values.values():
                         if values[0] and values[1]:
                             margins.append(float(np.mean(values[1]) - np.mean(values[0])))
-                total_loss_sum += float(loss.detach().cpu()) * len(batch)
+                total_bce_loss_sum += float(bce_loss.detach().cpu()) * len(batch)
+                total_ranking_loss_sum += float(ranking_loss.detach().cpu()) * batch_triplets
+                ranking_triplet_count += batch_triplets
+                ranking_active_count += batch_active_fraction * batch_triplets
+                rc_pair_count += batch_rc_count
+                original_pair_count += len(original_batch)
                 pair_count += len(batch)
                 global_step += 1
 
             if stop_requested:
                 break
+            mean_bce_loss = total_bce_loss_sum / pair_count
+            mean_ranking_loss = (
+                total_ranking_loss_sum / ranking_triplet_count
+                if ranking_triplet_count
+                else 0.0
+            )
             train_metrics = {
-                "train_loss": total_loss_sum / pair_count,
+                "train_loss": mean_bce_loss + ranking_weight * mean_ranking_loss,
+                "train_bce_loss": mean_bce_loss,
+                "train_ranking_loss": mean_ranking_loss,
+                "train_ranking_active_fraction": (
+                    ranking_active_count / ranking_triplet_count
+                    if ranking_triplet_count
+                    else 0.0
+                ),
+                "train_ranking_triplets": ranking_triplet_count,
+                "train_rc_augmentation_fraction": rc_pair_count / original_pair_count,
+                "train_rc_added_pairs": rc_pair_count,
                 "train_positive_loss": float(np.mean(positive_loss_values)),
                 "train_negative_loss": float(np.mean(negative_loss_values)),
                 **_quantiles(positive_cosines, "train_positive_cosine"),
                 **_quantiles(negative_cosines, "train_negative_cosine"),
                 "train_pair_margin_mean": float(np.mean(margins)),
             }
-            evaluation, scores = _retrieval_evaluation(
-                model,
-                candidate_store,
-                test_dna_store,
-                query_keys,
-                candidate_keys,
-                truth,
-                query_metadata,
-                device,
-                recall_ks,
-            )
+            evaluation, scores, top_rows = run_retrieval()
             test_pair_metrics, test_positive_cosines, test_negative_cosines = _evaluate_labeled_pairs(
-                model, test_pairs, candidate_store, test_dna_store, device
+                model, test_pairs, test_candidate_store, test_dna_store, device
             )
-            is_best = _is_better(evaluation.metrics, epoch, best)
+            is_best = _is_better(
+                evaluation.metrics, epoch, best, selection_tiebreak=selection_tiebreak
+            )
             if is_best:
                 best = {"epoch": epoch, "metrics": evaluation.metrics}
             epoch_seconds = time.perf_counter() - epoch_start
@@ -704,20 +976,7 @@ def train(
             if is_best:
                 atomic_torch_save(run_path / "checkpoints" / "best.pt", checkpoint)
                 best_checkpoint_sha = sha256_file(run_path / "checkpoints" / "best.pt")
-                export_dense_topk(
-                    run_path / "evaluation" / "best_dense_top10.tsv",
-                    scores,
-                    evaluation.ranks,
-                    query_keys,
-                    candidate_keys,
-                    10,
-                    best_checkpoint_sha[:20],
-                    sha256_text(canonical_json(candidate_store.manifest))[:20],
-                    sequences={
-                        key: row.get("sequence", "") for key, row in query_metadata.items()
-                    },
-                    candidate_metadata=candidate_metadata,
-                )
+                export_best_retrieval(evaluation, scores, top_rows, best_checkpoint_sha)
                 atomic_json_dump(run_path / "evaluation" / "best_metrics.json", best)
                 export_query_rows(
                     run_path / "evaluation" / "best_query_metrics.tsv", evaluation.query_rows

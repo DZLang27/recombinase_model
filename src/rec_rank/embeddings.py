@@ -39,6 +39,65 @@ class EmbeddingStore:
         return all(key in self.key_to_index for key in keys)
 
 
+def merge_embedding_stores(
+    stores: list[EmbeddingStore], names: list[str] | None = None
+) -> EmbeddingStore:
+    """按输入顺序合并 cache，并验证重复 key 的 embedding 完全兼容。"""
+    if not stores:
+        raise ValueError("至少需要一个 embedding store")
+    if names is None:
+        names = [f"store_{index}" for index in range(len(stores))]
+    if len(names) != len(stores):
+        raise ValueError("names 与 stores 数量不一致")
+    reference = stores[0]
+    compatibility_fields = ("model", "resolved_revision", "pooling", "normalization_version")
+    for store in stores[1:]:
+        if store.embeddings.shape[1] != reference.embeddings.shape[1]:
+            raise ValueError("embedding store 的维度不一致")
+        for field in compatibility_fields:
+            left = reference.manifest.get(field)
+            right = store.manifest.get(field)
+            if left is not None and right is not None and left != right:
+                raise ValueError(f"embedding store 的 {field} 不一致")
+
+    keys: list[str] = []
+    values: list[torch.Tensor] = []
+    index: dict[str, torch.Tensor] = {}
+    source_counts: dict[str, int] = {}
+    duplicate_count = 0
+    for name, store in zip(names, stores, strict=True):
+        source_counts[name] = len(store.keys)
+        for row_index, key in enumerate(store.keys):
+            value = store.embeddings[row_index]
+            previous = index.get(key)
+            if previous is not None:
+                duplicate_count += 1
+                if not torch.allclose(previous.float(), value.float(), rtol=1e-5, atol=1e-6):
+                    raise ValueError(f"重复 key {key} 的 embedding 不一致")
+                continue
+            index[key] = value
+            keys.append(key)
+            values.append(value)
+    embeddings = torch.stack(values)
+    manifest = {
+        "kind": "in_memory_embedding_union",
+        "count": len(keys),
+        "shape": list(embeddings.shape),
+        "ordered_keys_sha256": sha256_text("\n".join(keys)),
+        "model": reference.manifest.get("model"),
+        "resolved_revision": reference.manifest.get("resolved_revision"),
+        "pooling": reference.manifest.get("pooling"),
+        "normalization_version": reference.manifest.get("normalization_version"),
+        "source_counts": source_counts,
+        "duplicate_count": duplicate_count,
+        "source_manifest_sha256": {
+            name: sha256_text(json.dumps(store.manifest, sort_keys=True, ensure_ascii=False))
+            for name, store in zip(names, stores, strict=True)
+        },
+    }
+    return EmbeddingStore(keys=keys, embeddings=embeddings, manifest=manifest)
+
+
 def load_embedding_store(path: str | Path) -> EmbeddingStore:
     directory = Path(path)
     manifest_path = directory / "manifest.json"

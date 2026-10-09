@@ -5,8 +5,9 @@ from pathlib import Path
 from typing import Any
 
 import torch
+from torch.nn import functional as F
 
-from .data import normalize_dna, stable_key
+from .data import normalize_dna, reverse_complement, stable_key
 from .embeddings import BackboneEncoder, EmbeddingStore, load_embedding_store, save_embedding_store
 from .evaluation import (
     dense_rank_descending,
@@ -17,7 +18,7 @@ from .evaluation import (
     load_truth,
     recall_curve,
 )
-from .training import _project_store, load_checkpoint, model_from_checkpoint
+from .model_io import load_checkpoint, model_from_checkpoint, project_store
 from .utils import atomic_json_dump, canonical_json, read_tsv, sha256_file, sha256_text, write_tsv
 
 
@@ -38,7 +39,7 @@ def build_candidate_index(
             raise ValueError(f"候选 protein cache 的 {field} 与训练 checkpoint 不一致")
     if raw_store.embeddings.shape[1] != checkpoint["model_architecture"]["protein_dim"]:
         raise ValueError("候选 protein embedding 维度与 checkpoint 不一致")
-    projected = _project_store(model, raw_store, raw_store.keys, "protein", device)
+    projected = project_store(model, raw_store, raw_store.keys, "protein", device)
     checkpoint_sha = sha256_file(checkpoint_path)
     source_manifest_sha = sha256_text(canonical_json(raw_store.manifest))
     manifest = save_embedding_store(
@@ -106,8 +107,14 @@ def screen(
         raise ValueError("candidate index 与 checkpoint 不匹配，拒绝筛选")
     model = model_from_checkpoint(checkpoint, device)
     model.eval()
+    rc_ensemble = bool(
+        checkpoint.get("resolved_config", {})
+        .get("evaluation", {})
+        .get("reverse_complement_ensemble", False)
+    )
 
     sequences: list[str] = []
+    rc_sequences: list[str] = []
     if dna is not None:
         normalized = normalize_dna(dna)
         if normalized is None:
@@ -128,8 +135,22 @@ def screen(
             raise ValueError("query DNA embedding 维度与 checkpoint 不一致")
         query_keys = query_store.keys
         raw_query_embeddings = query_store.embeddings
+        if rc_ensemble:
+            source_path = query_store.manifest.get("input_path")
+            if not source_path or not Path(source_path).exists():
+                raise ValueError(
+                    "V1.1 cache 筛选需要 manifest.input_path 指向含 sequence 的 TSV，"
+                    "以便计算反向互补 ensemble"
+                )
+            sequence_by_key = {
+                row["dna_key"]: row["sequence"] for row in read_tsv(source_path)
+            }
+            try:
+                rc_sequences = [reverse_complement(sequence_by_key[key]) for key in query_keys]
+            except KeyError as exc:
+                raise ValueError(f"query cache 的源 TSV 缺少 sequence: {exc.args[0]}") from exc
 
-    if sequences:
+    if sequences or rc_sequences:
         backbone_cfg = checkpoint["resolved_config"]["backbones"]["dna"]
         training_dna_manifest = checkpoint.get("fingerprints", {}).get("test_dna_cache", {})
         pinned_revision = backbone_cfg.get("revision") or training_dna_manifest.get(
@@ -142,17 +163,30 @@ def screen(
             trust_remote_code=bool(backbone_cfg.get("trust_remote_code", False)),
         )
         batch_size = int(backbone_cfg.get("batch_size", 64))
-        encoded_batches = [
-            encoder.encode(sequences[start : start + batch_size])
-            for start in range(0, len(sequences), batch_size)
-        ]
-        raw_query_embeddings = torch.cat(encoded_batches, dim=0)
+        if sequences:
+            encoded_batches = [
+                encoder.encode(sequences[start : start + batch_size])
+                for start in range(0, len(sequences), batch_size)
+            ]
+            raw_query_embeddings = torch.cat(encoded_batches, dim=0)
+            if rc_ensemble:
+                rc_sequences = [reverse_complement(sequence) for sequence in sequences]
+        if rc_ensemble:
+            rc_encoded_batches = [
+                encoder.encode(rc_sequences[start : start + batch_size])
+                for start in range(0, len(rc_sequences), batch_size)
+            ]
+            raw_rc_query_embeddings = torch.cat(rc_encoded_batches, dim=0)
 
     with torch.inference_mode():
         query_vectors = []
         for start in range(0, len(query_keys), 4096):
             raw = raw_query_embeddings[start : start + 4096].to(device).float()
-            query_vectors.append(model.project_dnas(raw).float().cpu())
+            projected = model.project_dnas(raw)
+            if rc_ensemble:
+                raw_rc = raw_rc_query_embeddings[start : start + 4096].to(device).float()
+                projected = F.normalize(projected + model.project_dnas(raw_rc), p=2, dim=-1)
+            query_vectors.append(projected.float().cpu())
         projected_queries = torch.cat(query_vectors, dim=0)
     scores = (
         projected_queries.to(device) @ index_store.embeddings.to(device=device, dtype=torch.float32).T
@@ -195,8 +229,8 @@ def evaluate_checkpoint(
     truth = load_truth(truth_path)
     metadata = load_query_metadata(query_metadata_path)
     query_keys = list(truth)
-    candidate_vectors = _project_store(model, candidates, candidates.keys, "protein", device)
-    query_vectors = _project_store(model, queries, query_keys, "dna", device)
+    candidate_vectors = project_store(model, candidates, candidates.keys, "protein", device)
+    query_vectors = project_store(model, queries, query_keys, "dna", device)
     scores = (query_vectors.to(device) @ candidate_vectors.to(device).T).float().cpu()
     evaluation = evaluate_score_matrix(
         scores,
