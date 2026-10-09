@@ -1,0 +1,24 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+.agents/
+.codex/
+
+# 大体积可再生文件与实验输出
+data/
+embeddings/
+runs/
+evaluations/
+candidate_indexes/
+
+# 原始数据、模型与临时文件
+train_dataset_with_neg.txt
+test_dataset_with_neg.txt
+*.fasta
+*.pt
+*.tmp
+.matplotlib/
+
+# 集群运行日志
+slurm-*.out

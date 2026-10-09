@@ -1,0 +1,9 @@
+torch>=2.2
+transformers==4.57.1
+safetensors>=0.4
+sentencepiece>=0.2
+PyYAML>=6.0
+numpy>=1.26
+tensorboard>=2.16
+matplotlib>=3.8
+pytest>=8.0
