@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 import random
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Iterator
 
 from .data import CATEGORIES
@@ -14,6 +16,60 @@ class SampledPair:
     label: int
     category: str
     group_index: int
+
+
+@dataclass(frozen=True)
+class DnaRankingGroup:
+    dna_key: str
+    positive_protein_keys: tuple[str, ...]
+    negative_protein_keys: tuple[str, ...]
+
+    @property
+    def triplet_count(self) -> int:
+        return len(self.positive_protein_keys) * len(self.negative_protein_keys)
+
+
+def load_dna_ranking_groups(path: str | Path) -> list[DnaRankingGroup]:
+    groups: list[DnaRankingGroup] = []
+    with Path(path).open(encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, start=1):
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            positives = tuple(row.get("positive_protein_keys", []))
+            negatives = tuple(row.get("negative_protein_keys", []))
+            if not positives or not negatives:
+                raise ValueError(f"{path}:{line_number} 缺少显式正蛋白或负蛋白")
+            overlap = set(positives) & set(negatives)
+            if overlap:
+                raise ValueError(
+                    f"{path}:{line_number} 同一 DNA 的正负蛋白冲突: {sorted(overlap)[:3]}"
+                )
+            group = DnaRankingGroup(
+                dna_key=row["dna_key"],
+                positive_protein_keys=positives,
+                negative_protein_keys=negatives,
+            )
+            expected = row.get("triplet_count")
+            if expected is not None and int(expected) != group.triplet_count:
+                raise ValueError(f"{path}:{line_number} triplet_count 不一致")
+            groups.append(group)
+    return groups
+
+
+class DnaRankingBatchSampler:
+    def __init__(self, groups: list[DnaRankingGroup], queries_per_batch: int, seed: int) -> None:
+        if queries_per_batch <= 0:
+            raise ValueError("queries_per_batch 必须大于 0")
+        self.groups = groups
+        self.queries_per_batch = queries_per_batch
+        self.seed = seed
+
+    def iter_batches(self, epoch: int) -> Iterator[list[DnaRankingGroup]]:
+        indices = list(range(len(self.groups)))
+        random.Random(self.seed + 1_000_003 + epoch).shuffle(indices)
+        for start in range(0, len(indices), self.queries_per_batch):
+            yield [self.groups[index] for index in indices[start : start + self.queries_per_batch]]
 
 
 def sample_group(group: dict[str, Any], epoch: int, group_index: int) -> list[SampledPair]:
@@ -82,4 +138,3 @@ def cumulative_pair_coverage(groups: list[dict[str, Any]], through_epoch: int) -
                 seen.add((pair.protein_key, pair.dna_key))
     total = len(all_pairs)
     return len(seen), total, len(seen) / total if total else 0.0
-

@@ -185,6 +185,51 @@ def _write_reverse_complement_inputs(
     }
 
 
+def _write_dna_ranking_groups(
+    path: Path, memberships: Iterable[Membership]
+) -> dict[str, int]:
+    """写出同一 DNA 下显式正、负蛋白集合；unknown 组合不进入文件。"""
+    labels: dict[str, dict[int, set[str]]] = defaultdict(
+        lambda: {0: set(), 1: set()}
+    )
+    for item in memberships:
+        labels[item.dna_key][item.label].add(item.protein_key)
+
+    eligible = [dna_key for dna_key, values in labels.items() if values[0] and values[1]]
+    positive_pairs = 0
+    negative_pairs = 0
+    triplets = 0
+    with path.open("w", encoding="utf-8") as handle:
+        for dna_key in sorted(eligible):
+            positives = sorted(labels[dna_key][1])
+            negatives = sorted(labels[dna_key][0])
+            positive_pairs += len(positives)
+            negative_pairs += len(negatives)
+            triplet_count = len(positives) * len(negatives)
+            triplets += triplet_count
+            handle.write(
+                json.dumps(
+                    {
+                        "dna_key": dna_key,
+                        "positive_protein_keys": positives,
+                        "negative_protein_keys": negatives,
+                        "triplet_count": triplet_count,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+                + "\n"
+            )
+    return {
+        "train_dnas_with_positive_proteins": sum(bool(values[1]) for values in labels.values()),
+        "train_dnas_with_negative_proteins": sum(bool(values[0]) for values in labels.values()),
+        "train_dna_ranking_queries": len(eligible),
+        "train_dna_ranking_positive_pairs": positive_pairs,
+        "train_dna_ranking_negative_pairs": negative_pairs,
+        "train_dna_ranking_triplets": triplets,
+    }
+
+
 def prepare_data(train_path: str | Path, test_path: str | Path, output_dir: str | Path) -> dict[str, Any]:
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
@@ -258,6 +303,9 @@ def prepare_data(train_path: str | Path, test_path: str | Path, output_dir: str 
             record: dict[str, Any] = {"protein_key": protein_key}
             record.update({category: sorted(grouped[protein_key][category]) for category in CATEGORIES})
             handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+    dna_ranking_summary = _write_dna_ranking_groups(
+        output / "train_dna_ranking_groups.jsonl", train_memberships
+    )
 
     # 测试候选空间由测试文件中的全部 unique protein sequence 构成。
     test_candidate_keys = set(test["protein_sequences"])
@@ -359,6 +407,7 @@ def prepare_data(train_path: str | Path, test_path: str | Path, output_dir: str 
         "train_positive_pairs": len(train_positive_pairs),
         "train_negative_pairs": len(train_negative_pairs),
         "train_conflicting_pairs_removed": len(train_conflicts),
+        **dna_ranking_summary,
         "test_raw_rows": test["raw_rows"],
         "test_unique_candidates": len(test_candidate_keys),
         "test_unique_queries": len(truth),

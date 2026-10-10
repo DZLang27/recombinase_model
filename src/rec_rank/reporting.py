@@ -56,6 +56,7 @@ def generate_report(run_dir: str | Path) -> list[Path]:
     best_epoch = int(best["epoch"])
     config = load_yaml(run / "resolved_config.yaml")
     evaluation_cfg = config.get("evaluation", {})
+    training_cfg = config.get("training", {})
     full_library = evaluation_cfg.get("candidate_library") == "train_test_union"
     primary_metric = evaluation_cfg.get("primary_metric", "recall_at_10")
     generated: list[Path] = []
@@ -71,6 +72,18 @@ def generate_report(run_dir: str | Path) -> list[Path]:
     ax.plot(epochs, _series(history, "train_loss"), label="train combined loss")
     if "train_bce_loss" in history[-1]:
         ax.plot(epochs, _series(history, "train_bce_loss"), label="train BCE")
+    if float(training_cfg.get("dna_ranking_loss_weight", 0.0)) > 0:
+        ax.plot(
+            epochs,
+            _series(history, "train_dna_ranking_loss"),
+            label="DNA-centric ranking",
+        )
+    if float(training_cfg.get("rc_consistency_loss_weight", 0.0)) > 0:
+        ax.plot(
+            epochs,
+            _series(history, "train_rc_consistency_loss"),
+            label="RC consistency",
+        )
     ax.plot(epochs, _series(history, "test_loss"), label="test BCE")
     ax.axvline(best_epoch, color="black", linestyle="--", alpha=0.5, label=f"best={best_epoch}")
     ax.set(xlabel="Epoch", ylabel="Loss", title="Training objective and labeled-pair BCE")
@@ -184,7 +197,6 @@ def generate_report(run_dir: str | Path) -> list[Path]:
     ax.grid(alpha=0.25)
     save(fig, "cosine_and_margin.png")
 
-    training_cfg = config.get("training", {})
     if float(training_cfg.get("ranking_loss_weight", 0.0)) > 0 or float(
         training_cfg.get("reverse_complement_augmentation_fraction", 0.0)
     ) > 0:
@@ -214,6 +226,43 @@ def generate_report(run_dir: str | Path) -> list[Path]:
         right.legend(loc="upper right")
         left.grid(alpha=0.25)
         save(fig, "ranking_and_rc.png")
+
+    if float(training_cfg.get("dna_ranking_loss_weight", 0.0)) > 0:
+        fig, axes = plt.subplots(2, 1, figsize=(8, 8), sharex=True)
+        axes[0].plot(
+            epochs,
+            _series(history, "train_dna_ranking_loss"),
+            label="DNA-centric ranking loss",
+        )
+        axes[0].plot(
+            epochs,
+            _series(history, "train_dna_ranking_active_fraction"),
+            label="active comparison fraction",
+        )
+        axes[0].plot(
+            epochs,
+            _series(history, "train_dna_ranking_margin_mean"),
+            label="positive-negative margin",
+        )
+        axes[0].axvline(best_epoch, color="black", linestyle="--", alpha=0.5)
+        axes[0].set(ylabel="Loss / fraction / cosine", title="DNA-centric retrieval supervision")
+        axes[0].legend()
+        axes[0].grid(alpha=0.25)
+        axes[1].plot(
+            epochs,
+            _series(history, "train_rc_consistency_loss"),
+            label="RC consistency loss",
+        )
+        axes[1].plot(
+            epochs,
+            _series(history, "train_rc_embedding_cosine_mean"),
+            label="DNA-RC embedding cosine",
+        )
+        axes[1].axvline(best_epoch, color="black", linestyle="--", alpha=0.5)
+        axes[1].set(xlabel="Epoch", ylabel="Value", title="Orientation consistency")
+        axes[1].legend()
+        axes[1].grid(alpha=0.25)
+        save(fig, "dna_ranking_and_rc_consistency.png")
 
     last_epoch = int(max(epochs))
     middle_epoch = last_epoch // 2
@@ -256,7 +305,17 @@ def generate_report(run_dir: str | Path) -> list[Path]:
     ax.legend()
     save(fig, "recall_at_k.png")
 
-    model_version = "V1.1" if full_library else "V1"
+    configured_version = config.get("model", {}).get("version")
+    model_version = configured_version or ("V1.1" if full_library else "V1")
+    novel_queries = int(best["metrics"].get("novel_dna_queries", 0))
+    novel_recall_at_10 = float(
+        best["metrics"].get("novel_dna_recall_at_10", float("nan"))
+    )
+    novel_hits = (
+        int(round(novel_queries * novel_recall_at_10))
+        if novel_queries and np.isfinite(novel_recall_at_10)
+        else None
+    )
     report_lines = [
         f"# RecRank {model_version} run report: {run.name}",
         "",
@@ -264,7 +323,8 @@ def generate_report(run_dir: str | Path) -> list[Path]:
         f"- Checkpoint selection metric: {primary_metric}",
         f"- Candidate library: {'train+test protein union' if full_library else 'test-only'}",
         f"- Recall@10: {best['metrics']['recall_at_10']:.6f}",
-        f"- Novel-DNA Recall@10: {best['metrics'].get('novel_dna_recall_at_10', float('nan')):.6f}",
+        f"- Novel-DNA Recall@10: {novel_recall_at_10:.6f}",
+        f"- Novel-DNA TOP10 hits: {novel_hits if novel_hits is not None else 'N/A'} / {novel_queries or 'N/A'}",
         f"- MRR: {best['metrics']['mrr']:.6f}",
         f"- Median dense rank: {best['metrics']['median_rank']:.3f}",
         "- 注意：本轮实验按既定方案使用测试集逐 epoch 选 best，因此这些数值不是未触碰测试集上的无偏最终估计。",

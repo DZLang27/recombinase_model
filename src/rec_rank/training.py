@@ -26,7 +26,12 @@ from .evaluation import (
 )
 from .model import RecRankModel
 from .model_io import load_checkpoint, project_store
-from .sampler import EpochBatchSampler
+from .sampler import (
+    DnaRankingBatchSampler,
+    DnaRankingGroup,
+    EpochBatchSampler,
+    load_dna_ranking_groups,
+)
 from .full_library import (
     _build_truths,
     _candidate_metadata,
@@ -58,6 +63,17 @@ HISTORY_FIELDS = [
     "train_ranking_loss",
     "train_ranking_active_fraction",
     "train_ranking_triplets",
+    "train_protein_ranking_loss",
+    "train_protein_ranking_active_fraction",
+    "train_protein_ranking_triplets",
+    "train_dna_ranking_loss",
+    "train_dna_ranking_active_fraction",
+    "train_dna_ranking_groups",
+    "train_dna_ranking_triplets",
+    "train_dna_ranking_comparisons",
+    "train_dna_ranking_margin_mean",
+    "train_rc_consistency_loss",
+    "train_rc_embedding_cosine_mean",
     "train_rc_augmentation_fraction",
     "train_rc_added_pairs",
     "train_positive_loss",
@@ -222,6 +238,119 @@ def explicit_ranking_loss(
     stacked = torch.stack(violations)
     active_fraction = float((stacked.detach() > 0).float().mean().cpu())
     return stacked.mean(), len(violations), active_fraction
+
+
+def grouped_protein_ranking_loss(
+    cosine: torch.Tensor,
+    batch: list[Any],
+    margin: float,
+    *,
+    smooth: bool,
+) -> tuple[torch.Tensor, int, int, float]:
+    """按蛋白先求组内均值再跨组平均，避免高标注度蛋白支配 loss。"""
+    by_group: dict[int, dict[int, list[int]]] = defaultdict(lambda: {0: [], 1: []})
+    for index, pair in enumerate(batch):
+        by_group[pair.group_index][pair.label].append(index)
+    group_losses: list[torch.Tensor] = []
+    raw_violations: list[torch.Tensor] = []
+    triplet_count = 0
+    for labels in by_group.values():
+        if not labels[0] or not labels[1]:
+            continue
+        positive = cosine[labels[1]][:, None]
+        negative = cosine[labels[0]][None, :]
+        raw = margin - positive + negative
+        losses = F.softplus(raw) if smooth else F.relu(raw)
+        group_losses.append(losses.mean())
+        raw_violations.append(raw.reshape(-1))
+        triplet_count += raw.numel()
+    if not group_losses:
+        return cosine.sum() * 0.0, 0, 0, 0.0
+    raw_values = torch.cat(raw_violations)
+    active_fraction = float((raw_values.detach() > 0).float().mean().cpu())
+    return torch.stack(group_losses).mean(), triplet_count, len(group_losses), active_fraction
+
+
+def dna_centric_ranking_loss(
+    model: RecRankModel,
+    groups: list[DnaRankingGroup],
+    protein_store: EmbeddingStore,
+    dna_store: EmbeddingStore,
+    rc_map: dict[str, str] | None,
+    device: torch.device,
+    margin: float,
+    *,
+    smooth: bool,
+    include_reverse_complement: bool,
+) -> tuple[torch.Tensor, int, int, float, float]:
+    """给定 DNA，仅在显式正、负蛋白之间构造检索方向的排序监督。"""
+    if not groups:
+        anchor = next(model.parameters())
+        return anchor.sum() * 0.0, 0, 0, 0.0, 0.0
+    dna_keys = [group.dna_key for group in groups]
+    dna_raw = dna_store.rows(dna_keys, device=device).float()
+    dna_vectors = model.project_dnas(dna_raw)
+    rc_vectors: torch.Tensor | None = None
+    if include_reverse_complement:
+        if rc_map is None:
+            raise ValueError("DNA-centric ranking 启用反向互补时缺少 RC 映射")
+        rc_keys = [rc_map[key] for key in dna_keys]
+        rc_raw = dna_store.rows(rc_keys, device=device).float()
+        rc_vectors = model.project_dnas(rc_raw)
+
+    group_losses: list[torch.Tensor] = []
+    raw_violations: list[torch.Tensor] = []
+    margins: list[torch.Tensor] = []
+    triplet_count = 0
+    comparison_count = 0
+    for index, group in enumerate(groups):
+        protein_keys = [*group.positive_protein_keys, *group.negative_protein_keys]
+        protein_raw = protein_store.rows(protein_keys, device=device).float()
+        protein_vectors = model.project_proteins(protein_raw)
+        positive_count = len(group.positive_protein_keys)
+        orientation_vectors = [dna_vectors[index]]
+        if rc_vectors is not None:
+            orientation_vectors.append(rc_vectors[index])
+        orientation_losses: list[torch.Tensor] = []
+        for dna_vector in orientation_vectors:
+            scores = protein_vectors @ dna_vector
+            positive = scores[:positive_count][:, None]
+            negative = scores[positive_count:][None, :]
+            raw = margin - positive + negative
+            losses = F.softplus(raw) if smooth else F.relu(raw)
+            orientation_losses.append(losses.mean())
+            raw_violations.append(raw.reshape(-1))
+            margins.append((positive - negative).reshape(-1))
+            comparison_count += raw.numel()
+        group_losses.append(torch.stack(orientation_losses).mean())
+        triplet_count += group.triplet_count
+
+    raw_values = torch.cat(raw_violations)
+    margin_values = torch.cat(margins)
+    return (
+        torch.stack(group_losses).mean(),
+        triplet_count,
+        comparison_count,
+        float((raw_values.detach() > 0).float().mean().cpu()),
+        float(margin_values.detach().float().mean().cpu()),
+    )
+
+
+def reverse_complement_consistency_loss(
+    model: RecRankModel,
+    dna_keys: list[str],
+    dna_store: EmbeddingStore,
+    rc_map: dict[str, str],
+    device: torch.device,
+) -> tuple[torch.Tensor, float]:
+    """在投影空间约束 DNA 与其反向互补方向一致，按 unique DNA 等权。"""
+    unique_keys = sorted(set(dna_keys))
+    original = dna_store.rows(unique_keys, device=device).float()
+    reverse = dna_store.rows([rc_map[key] for key in unique_keys], device=device).float()
+    original_vectors = model.project_dnas(original)
+    reverse_vectors = model.project_dnas(reverse)
+    cosine = (original_vectors * reverse_vectors).sum(dim=-1)
+    return (1.0 - cosine).mean(), float(cosine.detach().float().mean().cpu())
 
 
 def _load_rc_map(path: Path) -> dict[str, str]:
@@ -520,6 +649,36 @@ def train(
             query_eval_store = merge_embedding_stores(
                 [test_dna_store, query_rc_only], ["test_dna", "test_query_rc"]
             )
+    dna_ranking_path = processed / "train_dna_ranking_groups.jsonl"
+    dna_ranking_weight = float(training_cfg.get("dna_ranking_loss_weight", 0.0))
+    dna_ranking_groups: list[DnaRankingGroup] = []
+    dna_ranking_sampler: DnaRankingBatchSampler | None = None
+    if dna_ranking_weight > 0:
+        if not dna_ranking_path.exists():
+            raise ValueError(
+                "启用 DNA-centric ranking 前必须重新运行 prepare，"
+                "生成 train_dna_ranking_groups.jsonl"
+            )
+        dna_ranking_groups = load_dna_ranking_groups(dna_ranking_path)
+        expected_queries = training_cfg.get("dna_ranking_expected_queries")
+        expected_triplets = training_cfg.get("dna_ranking_expected_triplets")
+        actual_triplets = sum(group.triplet_count for group in dna_ranking_groups)
+        if expected_queries is not None and len(dna_ranking_groups) != int(expected_queries):
+            raise ValueError(
+                "DNA ranking query 数量不符合配置："
+                f"expected={expected_queries}, actual={len(dna_ranking_groups)}"
+            )
+        if expected_triplets is not None and actual_triplets != int(expected_triplets):
+            raise ValueError(
+                "DNA ranking triplet 数量不符合配置："
+                f"expected={expected_triplets}, actual={actual_triplets}"
+            )
+        dna_ranking_sampler = DnaRankingBatchSampler(
+            dna_ranking_groups,
+            int(training_cfg.get("dna_ranking_queries_per_batch", 8)),
+            seed,
+        )
+
     fingerprints = {
         "train_groups_sha256": sha256_file(processed / "train_groups.jsonl"),
         "test_truth_sha256": sha256_file(processed / "test_truth.tsv"),
@@ -533,6 +692,8 @@ def train(
         "candidate_audit": candidate_audit,
         "truth_audit": truth_audit,
     }
+    if dna_ranking_weight > 0:
+        fingerprints["train_dna_ranking_groups_sha256"] = sha256_file(dna_ranking_path)
 
     groups = load_groups(processed / "train_groups.jsonl")
     sampler = EpochBatchSampler(groups, int(training_cfg["proteins_per_batch"]), seed)
@@ -643,6 +804,14 @@ def train(
                 "reverse_complement_ensemble": bool(
                     evaluation_cfg.get("reverse_complement_ensemble", False)
                 ),
+                "dna_ranking_supervision": {
+                    "enabled": dna_ranking_weight > 0,
+                    "query_count": len(dna_ranking_groups),
+                    "triplet_count": sum(
+                        group.triplet_count for group in dna_ranking_groups
+                    ),
+                    "unknown_pairs_used_as_negatives": False,
+                },
             },
         )
         atomic_json_dump(run_path / "status.json", {"status": "running", "updated_at": utc_now_iso()})
@@ -823,6 +992,16 @@ def train(
             total_ranking_loss_sum = 0.0
             ranking_triplet_count = 0
             ranking_active_count = 0.0
+            protein_ranking_normalizer = 0
+            total_dna_ranking_loss_sum = 0.0
+            dna_ranking_group_count = 0
+            dna_ranking_triplet_count = 0
+            dna_ranking_comparison_count = 0
+            dna_ranking_active_count = 0.0
+            dna_ranking_margin_sum = 0.0
+            total_rc_consistency_loss_sum = 0.0
+            rc_consistency_dna_count = 0
+            rc_embedding_cosine_sum = 0.0
             rc_pair_count = 0
             original_pair_count = 0
             pair_count = 0
@@ -836,6 +1015,36 @@ def train(
             clip_norm = float(training_cfg["gradient_clip_norm"])
             ranking_weight = float(training_cfg.get("ranking_loss_weight", 0.0))
             ranking_margin = float(training_cfg.get("ranking_margin", 0.1))
+            ranking_loss_type = str(
+                training_cfg.get("protein_ranking_loss_type", "hinge")
+            ).lower()
+            protein_group_balanced = bool(
+                training_cfg.get("protein_ranking_group_balanced", False)
+            )
+            if ranking_loss_type not in {"hinge", "smooth"}:
+                raise ValueError("protein_ranking_loss_type 必须是 hinge 或 smooth")
+            dna_ranking_margin = float(
+                training_cfg.get("dna_ranking_margin", ranking_margin)
+            )
+            dna_ranking_loss_type = str(
+                training_cfg.get("dna_ranking_loss_type", "smooth")
+            ).lower()
+            if dna_ranking_loss_type not in {"hinge", "smooth"}:
+                raise ValueError("dna_ranking_loss_type 必须是 hinge 或 smooth")
+            dna_ranking_use_rc = bool(
+                training_cfg.get("dna_ranking_use_reverse_complement", True)
+            )
+            rc_consistency_weight = float(
+                training_cfg.get("rc_consistency_loss_weight", 0.0)
+            )
+            if (dna_ranking_use_rc and dna_ranking_weight > 0) or rc_consistency_weight > 0:
+                if train_rc_map is None:
+                    raise ValueError("V1.2 的 RC ranking/consistency 需要完整训练 RC 映射")
+            dna_ranking_batches = (
+                iter(dna_ranking_sampler.iter_batches(epoch))
+                if dna_ranking_sampler is not None
+                else iter(())
+            )
 
             for original_batch in sampler.iter_batches(epoch):
                 if stop_requested:
@@ -859,15 +1068,80 @@ def train(
                 labels = torch.tensor(
                     [pair.label for pair in batch], device=device, dtype=torch.float32
                 )
+                dna_ranking_batch = next(dna_ranking_batches, [])
                 optimizer.zero_grad(set_to_none=True)
                 with torch.autocast(
                     device_type=device.type, dtype=torch.bfloat16, enabled=amp_enabled
                 ):
                     bce_loss, logits, cosine = model.loss(proteins, dnas, labels)
-                    ranking_loss, batch_triplets, batch_active_fraction = explicit_ranking_loss(
-                        cosine, batch, ranking_margin
+                    if protein_group_balanced or ranking_loss_type == "smooth":
+                        (
+                            ranking_loss,
+                            batch_triplets,
+                            batch_ranking_groups,
+                            batch_active_fraction,
+                        ) = grouped_protein_ranking_loss(
+                            cosine,
+                            batch,
+                            ranking_margin,
+                            smooth=ranking_loss_type == "smooth",
+                        )
+                        batch_ranking_normalizer = batch_ranking_groups
+                    else:
+                        (
+                            ranking_loss,
+                            batch_triplets,
+                            batch_active_fraction,
+                        ) = explicit_ranking_loss(cosine, batch, ranking_margin)
+                        batch_ranking_groups = 0
+                        batch_ranking_normalizer = batch_triplets
+                    if dna_ranking_batch:
+                        (
+                            dna_ranking_loss,
+                            batch_dna_triplets,
+                            batch_dna_comparisons,
+                            batch_dna_active_fraction,
+                            batch_dna_margin,
+                        ) = dna_centric_ranking_loss(
+                            model,
+                            dna_ranking_batch,
+                            train_protein_store,
+                            train_dna_store,
+                            train_rc_map,
+                            device,
+                            dna_ranking_margin,
+                            smooth=dna_ranking_loss_type == "smooth",
+                            include_reverse_complement=dna_ranking_use_rc,
+                        )
+                    else:
+                        dna_ranking_loss = bce_loss * 0.0
+                        batch_dna_triplets = 0
+                        batch_dna_comparisons = 0
+                        batch_dna_active_fraction = 0.0
+                        batch_dna_margin = 0.0
+                    if rc_consistency_weight > 0:
+                        rc_consistency_loss, batch_rc_embedding_cosine = (
+                            reverse_complement_consistency_loss(
+                                model,
+                                [pair.dna_key for pair in original_batch],
+                                train_dna_store,
+                                train_rc_map,
+                                device,
+                            )
+                        )
+                        batch_rc_unique_count = len(
+                            {pair.dna_key for pair in original_batch}
+                        )
+                    else:
+                        rc_consistency_loss = bce_loss * 0.0
+                        batch_rc_embedding_cosine = 0.0
+                        batch_rc_unique_count = 0
+                    loss = (
+                        bce_loss
+                        + ranking_weight * ranking_loss
+                        + dna_ranking_weight * dna_ranking_loss
+                        + rc_consistency_weight * rc_consistency_loss
                     )
-                    loss = bce_loss + ranking_weight * ranking_loss
                 if not torch.isfinite(loss):
                     raise FloatingPointError(f"epoch {epoch} step {global_step}: loss 为 NaN/Inf")
                 scaler.scale(loss).backward()
@@ -901,24 +1175,69 @@ def train(
                         if values[0] and values[1]:
                             margins.append(float(np.mean(values[1]) - np.mean(values[0])))
                 total_bce_loss_sum += float(bce_loss.detach().cpu()) * len(batch)
-                total_ranking_loss_sum += float(ranking_loss.detach().cpu()) * batch_triplets
+                total_ranking_loss_sum += (
+                    float(ranking_loss.detach().cpu()) * batch_ranking_normalizer
+                )
+                protein_ranking_normalizer += batch_ranking_normalizer
                 ranking_triplet_count += batch_triplets
                 ranking_active_count += batch_active_fraction * batch_triplets
+                if dna_ranking_batch:
+                    batch_group_count = len(dna_ranking_batch)
+                    total_dna_ranking_loss_sum += (
+                        float(dna_ranking_loss.detach().cpu()) * batch_group_count
+                    )
+                    dna_ranking_group_count += batch_group_count
+                    dna_ranking_triplet_count += batch_dna_triplets
+                    dna_ranking_comparison_count += batch_dna_comparisons
+                    dna_ranking_active_count += (
+                        batch_dna_active_fraction * batch_dna_comparisons
+                    )
+                    dna_ranking_margin_sum += batch_dna_margin * batch_dna_comparisons
+                if batch_rc_unique_count:
+                    total_rc_consistency_loss_sum += (
+                        float(rc_consistency_loss.detach().cpu())
+                        * batch_rc_unique_count
+                    )
+                    rc_embedding_cosine_sum += (
+                        batch_rc_embedding_cosine * batch_rc_unique_count
+                    )
+                    rc_consistency_dna_count += batch_rc_unique_count
                 rc_pair_count += batch_rc_count
                 original_pair_count += len(original_batch)
                 pair_count += len(batch)
                 global_step += 1
 
+            if next(dna_ranking_batches, None) is not None:
+                raise RuntimeError(
+                    "DNA ranking batch 数多于主训练 batch；请增大 "
+                    "training.dna_ranking_queries_per_batch"
+                )
+
             if stop_requested:
                 break
             mean_bce_loss = total_bce_loss_sum / pair_count
             mean_ranking_loss = (
-                total_ranking_loss_sum / ranking_triplet_count
-                if ranking_triplet_count
+                total_ranking_loss_sum / protein_ranking_normalizer
+                if protein_ranking_normalizer
+                else 0.0
+            )
+            mean_dna_ranking_loss = (
+                total_dna_ranking_loss_sum / dna_ranking_group_count
+                if dna_ranking_group_count
+                else 0.0
+            )
+            mean_rc_consistency_loss = (
+                total_rc_consistency_loss_sum / rc_consistency_dna_count
+                if rc_consistency_dna_count
                 else 0.0
             )
             train_metrics = {
-                "train_loss": mean_bce_loss + ranking_weight * mean_ranking_loss,
+                "train_loss": (
+                    mean_bce_loss
+                    + ranking_weight * mean_ranking_loss
+                    + dna_ranking_weight * mean_dna_ranking_loss
+                    + rc_consistency_weight * mean_rc_consistency_loss
+                ),
                 "train_bce_loss": mean_bce_loss,
                 "train_ranking_loss": mean_ranking_loss,
                 "train_ranking_active_fraction": (
@@ -927,6 +1246,33 @@ def train(
                     else 0.0
                 ),
                 "train_ranking_triplets": ranking_triplet_count,
+                "train_protein_ranking_loss": mean_ranking_loss,
+                "train_protein_ranking_active_fraction": (
+                    ranking_active_count / ranking_triplet_count
+                    if ranking_triplet_count
+                    else 0.0
+                ),
+                "train_protein_ranking_triplets": ranking_triplet_count,
+                "train_dna_ranking_loss": mean_dna_ranking_loss,
+                "train_dna_ranking_active_fraction": (
+                    dna_ranking_active_count / dna_ranking_comparison_count
+                    if dna_ranking_comparison_count
+                    else 0.0
+                ),
+                "train_dna_ranking_groups": dna_ranking_group_count,
+                "train_dna_ranking_triplets": dna_ranking_triplet_count,
+                "train_dna_ranking_comparisons": dna_ranking_comparison_count,
+                "train_dna_ranking_margin_mean": (
+                    dna_ranking_margin_sum / dna_ranking_comparison_count
+                    if dna_ranking_comparison_count
+                    else 0.0
+                ),
+                "train_rc_consistency_loss": mean_rc_consistency_loss,
+                "train_rc_embedding_cosine_mean": (
+                    rc_embedding_cosine_sum / rc_consistency_dna_count
+                    if rc_consistency_dna_count
+                    else 0.0
+                ),
                 "train_rc_augmentation_fraction": rc_pair_count / original_pair_count,
                 "train_rc_added_pairs": rc_pair_count,
                 "train_positive_loss": float(np.mean(positive_loss_values)),
