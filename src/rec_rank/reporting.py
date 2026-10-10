@@ -72,6 +72,8 @@ def generate_report(run_dir: str | Path) -> list[Path]:
     ax.plot(epochs, _series(history, "train_loss"), label="train combined loss")
     if "train_bce_loss" in history[-1]:
         ax.plot(epochs, _series(history, "train_bce_loss"), label="train BCE")
+    if float(training_cfg.get("clip_style_loss_weight", 0.0)) > 0:
+        ax.plot(epochs, _series(history, "train_clip_loss"), label="CLIP-style InfoNCE")
     if float(training_cfg.get("dna_ranking_loss_weight", 0.0)) > 0:
         ax.plot(
             epochs,
@@ -196,6 +198,52 @@ def generate_report(run_dir: str | Path) -> list[Path]:
     ax.legend()
     ax.grid(alpha=0.25)
     save(fig, "cosine_and_margin.png")
+
+    if float(training_cfg.get("clip_style_loss_weight", 0.0)) > 0:
+        fig, axes = plt.subplots(2, 1, figsize=(8, 8), sharex=True)
+        axes[0].plot(
+            epochs,
+            _series(history, "train_clip_loss"),
+            label="symmetric CLIP loss",
+        )
+        axes[0].plot(
+            epochs,
+            _series(history, "train_clip_protein_to_dna_loss"),
+            label="protein→DNA",
+        )
+        axes[0].plot(
+            epochs,
+            _series(history, "train_clip_dna_to_protein_loss"),
+            label="DNA→protein",
+        )
+        axes[0].axvline(best_epoch, color="black", linestyle="--", alpha=0.5)
+        axes[0].set(ylabel="InfoNCE", title="Multi-positive CLIP-style objective")
+        axes[0].legend()
+        axes[0].grid(alpha=0.25)
+        axes[1].plot(
+            epochs,
+            _series(history, "train_clip_positive_cosine_mean"),
+            label="known positive",
+        )
+        axes[1].plot(
+            epochs,
+            _series(history, "train_clip_explicit_negative_cosine_mean"),
+            label="explicit negative",
+        )
+        axes[1].plot(
+            epochs,
+            _series(history, "train_clip_unknown_negative_cosine_mean"),
+            label="unknown as negative",
+        )
+        axes[1].axvline(best_epoch, color="black", linestyle="--", alpha=0.5)
+        axes[1].set(
+            xlabel="Epoch",
+            ylabel="Mean cosine",
+            title="CLIP matrix cosine by label status",
+        )
+        axes[1].legend()
+        axes[1].grid(alpha=0.25)
+        save(fig, "clip_style_diagnostics.png")
 
     if float(training_cfg.get("ranking_loss_weight", 0.0)) > 0 or float(
         training_cfg.get("reverse_complement_augmentation_fraction", 0.0)

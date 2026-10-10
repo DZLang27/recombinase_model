@@ -76,6 +76,18 @@ HISTORY_FIELDS = [
     "train_rc_embedding_cosine_mean",
     "train_rc_augmentation_fraction",
     "train_rc_added_pairs",
+    "train_clip_loss",
+    "train_clip_protein_to_dna_loss",
+    "train_clip_dna_to_protein_loss",
+    "train_clip_matrix_cells",
+    "train_clip_positive_cells",
+    "train_clip_explicit_negative_cells",
+    "train_clip_unknown_negative_cells",
+    "train_clip_active_proteins",
+    "train_clip_active_dnas",
+    "train_clip_positive_cosine_mean",
+    "train_clip_explicit_negative_cosine_mean",
+    "train_clip_unknown_negative_cosine_mean",
     "train_positive_loss",
     "train_negative_loss",
     "train_positive_cosine_mean",
@@ -269,6 +281,115 @@ def grouped_protein_ranking_loss(
     raw_values = torch.cat(raw_violations)
     active_fraction = float((raw_values.detach() > 0).float().mean().cpu())
     return torch.stack(group_losses).mean(), triplet_count, len(group_losses), active_fraction
+
+
+def multi_positive_clip_loss(
+    model: RecRankModel,
+    protein_keys: list[str],
+    dna_keys: list[str],
+    protein_store: EmbeddingStore,
+    dna_store: EmbeddingStore,
+    positive_dnas_by_protein: dict[str, set[str]],
+    negative_dnas_by_protein: dict[str, set[str]],
+    device: torch.device,
+) -> tuple[torch.Tensor, dict[str, float | int]]:
+    """对 batch 全交叉矩阵计算对称 multi-positive InfoNCE。
+
+    已知正 pair 使用均匀 multi-hot target；显式负 pair 与 unknown pair 都进入
+    softmax 分母。没有 batch 内正样本的行/列只作为候选负样本，不作为 query。
+    """
+    unique_proteins = list(dict.fromkeys(protein_keys))
+    unique_dnas = list(dict.fromkeys(dna_keys))
+    if not unique_proteins or not unique_dnas:
+        anchor = next(model.parameters())
+        return anchor.sum() * 0.0, {
+            "protein_to_dna_loss": 0.0,
+            "dna_to_protein_loss": 0.0,
+            "matrix_cells": 0,
+            "positive_cells": 0,
+            "explicit_negative_cells": 0,
+            "unknown_negative_cells": 0,
+            "active_proteins": 0,
+            "active_dnas": 0,
+            "positive_cosine_sum": 0.0,
+            "explicit_negative_cosine_sum": 0.0,
+            "unknown_negative_cosine_sum": 0.0,
+        }
+
+    dna_indices = {key: index for index, key in enumerate(unique_dnas)}
+    positive_mask_cpu = torch.zeros(
+        (len(unique_proteins), len(unique_dnas)), dtype=torch.bool
+    )
+    explicit_negative_mask_cpu = torch.zeros_like(positive_mask_cpu)
+    for protein_index, protein_key in enumerate(unique_proteins):
+        for dna_key in positive_dnas_by_protein.get(protein_key, set()):
+            dna_index = dna_indices.get(dna_key)
+            if dna_index is not None:
+                positive_mask_cpu[protein_index, dna_index] = True
+        for dna_key in negative_dnas_by_protein.get(protein_key, set()):
+            dna_index = dna_indices.get(dna_key)
+            if dna_index is not None:
+                explicit_negative_mask_cpu[protein_index, dna_index] = True
+    # 方向等价扩增后可能同时出现正、负记录；正标签优先，避免把合法正例送入分母标签。
+    explicit_negative_mask_cpu &= ~positive_mask_cpu
+
+    positive_mask = positive_mask_cpu.to(device=device)
+    explicit_negative_mask = explicit_negative_mask_cpu.to(device=device)
+    unknown_negative_mask = ~(positive_mask | explicit_negative_mask)
+
+    protein_raw = protein_store.rows(unique_proteins, device=device).float()
+    dna_raw = dna_store.rows(unique_dnas, device=device).float()
+    protein_vectors = model.project_proteins(protein_raw)
+    dna_vectors = model.project_dnas(dna_raw)
+    cosine = protein_vectors @ dna_vectors.T
+    logits = model.gamma * cosine
+
+    row_positive_counts = positive_mask.sum(dim=1)
+    column_positive_counts = positive_mask.sum(dim=0)
+    active_rows = row_positive_counts > 0
+    active_columns = column_positive_counts > 0
+    if not bool(active_rows.any()) or not bool(active_columns.any()):
+        raise ValueError("CLIP-style batch 中没有可用的已知正 pair")
+
+    row_targets = positive_mask[active_rows].to(logits.dtype)
+    row_targets = row_targets / row_positive_counts[active_rows, None].to(logits.dtype)
+    protein_to_dna_loss = -(
+        F.log_softmax(logits[active_rows], dim=1) * row_targets
+    ).sum(dim=1).mean()
+
+    column_targets = positive_mask[:, active_columns].T.to(logits.dtype)
+    column_targets = column_targets / column_positive_counts[active_columns, None].to(
+        logits.dtype
+    )
+    dna_to_protein_loss = -(
+        F.log_softmax(logits[:, active_columns].T, dim=1) * column_targets
+    ).sum(dim=1).mean()
+    loss = 0.5 * (protein_to_dna_loss + dna_to_protein_loss)
+
+    detached_cosine = cosine.detach().float()
+    positive_cells = int(positive_mask_cpu.sum())
+    explicit_negative_cells = int(explicit_negative_mask_cpu.sum())
+    matrix_cells = positive_mask_cpu.numel()
+    unknown_negative_cells = matrix_cells - positive_cells - explicit_negative_cells
+
+    def masked_sum(mask: torch.Tensor) -> float:
+        if not bool(mask.any()):
+            return 0.0
+        return float(detached_cosine[mask].sum().cpu())
+
+    return loss, {
+        "protein_to_dna_loss": float(protein_to_dna_loss.detach().float().cpu()),
+        "dna_to_protein_loss": float(dna_to_protein_loss.detach().float().cpu()),
+        "matrix_cells": matrix_cells,
+        "positive_cells": positive_cells,
+        "explicit_negative_cells": explicit_negative_cells,
+        "unknown_negative_cells": unknown_negative_cells,
+        "active_proteins": int(active_rows.sum().detach().cpu()),
+        "active_dnas": int(active_columns.sum().detach().cpu()),
+        "positive_cosine_sum": masked_sum(positive_mask),
+        "explicit_negative_cosine_sum": masked_sum(explicit_negative_mask),
+        "unknown_negative_cosine_sum": masked_sum(unknown_negative_mask),
+    }
 
 
 def dna_centric_ranking_loss(
@@ -679,6 +800,25 @@ def train(
             seed,
         )
 
+    clip_style_loss_weight = float(training_cfg.get("clip_style_loss_weight", 0.0))
+    if clip_style_loss_weight < 0:
+        raise ValueError("training.clip_style_loss_weight 不能小于 0")
+    train_pairs_path = processed / "train_pairs.tsv"
+    positive_dnas_by_protein: dict[str, set[str]] = defaultdict(set)
+    negative_dnas_by_protein: dict[str, set[str]] = defaultdict(set)
+    if clip_style_loss_weight > 0:
+        for row in read_tsv(train_pairs_path):
+            protein_key = row["protein_key"]
+            dna_key = row["dna_key"]
+            target = (
+                positive_dnas_by_protein
+                if int(row["label"]) == 1
+                else negative_dnas_by_protein
+            )
+            target[protein_key].add(dna_key)
+            if train_rc_map is not None:
+                target[protein_key].add(train_rc_map[dna_key])
+
     fingerprints = {
         "train_groups_sha256": sha256_file(processed / "train_groups.jsonl"),
         "test_truth_sha256": sha256_file(processed / "test_truth.tsv"),
@@ -694,6 +834,8 @@ def train(
     }
     if dna_ranking_weight > 0:
         fingerprints["train_dna_ranking_groups_sha256"] = sha256_file(dna_ranking_path)
+    if clip_style_loss_weight > 0:
+        fingerprints["train_pairs_sha256"] = sha256_file(train_pairs_path)
 
     groups = load_groups(processed / "train_groups.jsonl")
     sampler = EpochBatchSampler(groups, int(training_cfg["proteins_per_batch"]), seed)
@@ -821,6 +963,17 @@ def train(
                         group.triplet_count for group in dna_ranking_groups
                     ),
                     "unknown_pairs_used_as_negatives": False,
+                },
+                "clip_style_unknown_supervision": {
+                    "enabled": clip_style_loss_weight > 0,
+                    "loss": "symmetric_multi_positive_infonce",
+                    "loss_weight": clip_style_loss_weight,
+                    "matrix": "unique_batch_proteins_x_unique_batch_dnas",
+                    "known_positive_mask": "all_direction_equivalent_train_positives",
+                    "negative_denominator": "explicit_negatives_and_all_unknown_cells",
+                    "reverse_complement_dnas_in_matrix": rc_augmentation_fraction > 0,
+                    "retains_v1_3_supervised_bce_and_protein_ranking": True,
+                    "interpretation": "experimental_clip_style_unknown_negatives",
                 },
             },
         )
@@ -999,6 +1152,19 @@ def train(
                 torch.cuda.reset_peak_memory_stats(device)
             model.train()
             total_bce_loss_sum = 0.0
+            total_clip_loss_sum = 0.0
+            total_clip_protein_to_dna_loss_sum = 0.0
+            total_clip_dna_to_protein_loss_sum = 0.0
+            clip_batch_count = 0
+            clip_matrix_cells = 0
+            clip_positive_cells = 0
+            clip_explicit_negative_cells = 0
+            clip_unknown_negative_cells = 0
+            clip_active_proteins = 0
+            clip_active_dnas = 0
+            clip_positive_cosine_sum = 0.0
+            clip_explicit_negative_cosine_sum = 0.0
+            clip_unknown_negative_cosine_sum = 0.0
             total_ranking_loss_sum = 0.0
             ranking_triplet_count = 0
             ranking_active_count = 0.0
@@ -1129,6 +1295,32 @@ def train(
                         batch_dna_comparisons = 0
                         batch_dna_active_fraction = 0.0
                         batch_dna_margin = 0.0
+                    if clip_style_loss_weight > 0:
+                        clip_loss, batch_clip_stats = multi_positive_clip_loss(
+                            model,
+                            [pair.protein_key for pair in original_batch],
+                            dna_keys,
+                            train_protein_store,
+                            train_dna_store,
+                            positive_dnas_by_protein,
+                            negative_dnas_by_protein,
+                            device,
+                        )
+                    else:
+                        clip_loss = bce_loss * 0.0
+                        batch_clip_stats = {
+                            "protein_to_dna_loss": 0.0,
+                            "dna_to_protein_loss": 0.0,
+                            "matrix_cells": 0,
+                            "positive_cells": 0,
+                            "explicit_negative_cells": 0,
+                            "unknown_negative_cells": 0,
+                            "active_proteins": 0,
+                            "active_dnas": 0,
+                            "positive_cosine_sum": 0.0,
+                            "explicit_negative_cosine_sum": 0.0,
+                            "unknown_negative_cosine_sum": 0.0,
+                        }
                     if rc_consistency_weight > 0:
                         rc_consistency_loss, batch_rc_embedding_cosine = (
                             reverse_complement_consistency_loss(
@@ -1151,6 +1343,7 @@ def train(
                         + ranking_weight * ranking_loss
                         + dna_ranking_weight * dna_ranking_loss
                         + rc_consistency_weight * rc_consistency_loss
+                        + clip_style_loss_weight * clip_loss
                     )
                 if not torch.isfinite(loss):
                     raise FloatingPointError(f"epoch {epoch} step {global_step}: loss 为 NaN/Inf")
@@ -1185,6 +1378,34 @@ def train(
                         if values[0] and values[1]:
                             margins.append(float(np.mean(values[1]) - np.mean(values[0])))
                 total_bce_loss_sum += float(bce_loss.detach().cpu()) * len(batch)
+                if clip_style_loss_weight > 0:
+                    total_clip_loss_sum += float(clip_loss.detach().float().cpu())
+                    total_clip_protein_to_dna_loss_sum += float(
+                        batch_clip_stats["protein_to_dna_loss"]
+                    )
+                    total_clip_dna_to_protein_loss_sum += float(
+                        batch_clip_stats["dna_to_protein_loss"]
+                    )
+                    clip_batch_count += 1
+                    clip_matrix_cells += int(batch_clip_stats["matrix_cells"])
+                    clip_positive_cells += int(batch_clip_stats["positive_cells"])
+                    clip_explicit_negative_cells += int(
+                        batch_clip_stats["explicit_negative_cells"]
+                    )
+                    clip_unknown_negative_cells += int(
+                        batch_clip_stats["unknown_negative_cells"]
+                    )
+                    clip_active_proteins += int(batch_clip_stats["active_proteins"])
+                    clip_active_dnas += int(batch_clip_stats["active_dnas"])
+                    clip_positive_cosine_sum += float(
+                        batch_clip_stats["positive_cosine_sum"]
+                    )
+                    clip_explicit_negative_cosine_sum += float(
+                        batch_clip_stats["explicit_negative_cosine_sum"]
+                    )
+                    clip_unknown_negative_cosine_sum += float(
+                        batch_clip_stats["unknown_negative_cosine_sum"]
+                    )
                 total_ranking_loss_sum += (
                     float(ranking_loss.detach().cpu()) * batch_ranking_normalizer
                 )
@@ -1226,6 +1447,19 @@ def train(
             if stop_requested:
                 break
             mean_bce_loss = total_bce_loss_sum / pair_count
+            mean_clip_loss = (
+                total_clip_loss_sum / clip_batch_count if clip_batch_count else 0.0
+            )
+            mean_clip_protein_to_dna_loss = (
+                total_clip_protein_to_dna_loss_sum / clip_batch_count
+                if clip_batch_count
+                else 0.0
+            )
+            mean_clip_dna_to_protein_loss = (
+                total_clip_dna_to_protein_loss_sum / clip_batch_count
+                if clip_batch_count
+                else 0.0
+            )
             mean_ranking_loss = (
                 total_ranking_loss_sum / protein_ranking_normalizer
                 if protein_ranking_normalizer
@@ -1247,8 +1481,33 @@ def train(
                     + ranking_weight * mean_ranking_loss
                     + dna_ranking_weight * mean_dna_ranking_loss
                     + rc_consistency_weight * mean_rc_consistency_loss
+                    + clip_style_loss_weight * mean_clip_loss
                 ),
                 "train_bce_loss": mean_bce_loss,
+                "train_clip_loss": mean_clip_loss,
+                "train_clip_protein_to_dna_loss": mean_clip_protein_to_dna_loss,
+                "train_clip_dna_to_protein_loss": mean_clip_dna_to_protein_loss,
+                "train_clip_matrix_cells": clip_matrix_cells,
+                "train_clip_positive_cells": clip_positive_cells,
+                "train_clip_explicit_negative_cells": clip_explicit_negative_cells,
+                "train_clip_unknown_negative_cells": clip_unknown_negative_cells,
+                "train_clip_active_proteins": clip_active_proteins,
+                "train_clip_active_dnas": clip_active_dnas,
+                "train_clip_positive_cosine_mean": (
+                    clip_positive_cosine_sum / clip_positive_cells
+                    if clip_positive_cells
+                    else float("nan")
+                ),
+                "train_clip_explicit_negative_cosine_mean": (
+                    clip_explicit_negative_cosine_sum / clip_explicit_negative_cells
+                    if clip_explicit_negative_cells
+                    else float("nan")
+                ),
+                "train_clip_unknown_negative_cosine_mean": (
+                    clip_unknown_negative_cosine_sum / clip_unknown_negative_cells
+                    if clip_unknown_negative_cells
+                    else float("nan")
+                ),
                 "train_ranking_loss": mean_ranking_loss,
                 "train_ranking_active_fraction": (
                     ranking_active_count / ranking_triplet_count

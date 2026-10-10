@@ -268,6 +268,40 @@ def test_synthetic_training_checkpoint_index_and_screen(tmp_path: Path) -> None:
     assert v13_checkpoint["model_architecture"]["projection_dim"] == 6
     assert len(v13_checkpoint["model_state"]["protein_projection.blocks.0.layer_scale"]) == 6
 
+    # V1.5 keeps V1.3 fixed and adds a full in-batch protein×DNA
+    # multi-positive CLIP objective whose non-positive cells include unknowns.
+    v15_config = copy.deepcopy(v13_config)
+    v15_config["model"]["version"] = "v1.5-clip-style"
+    v15_config["training"]["clip_style_loss_weight"] = 1.0
+    v15_config["runtime"]["run_root"] = str(tmp_path / "runs_v15")
+    v15_run = train(v15_config, torch.device("cpu"))
+    v15_history = list(csv.DictReader((v15_run / "logs" / "history.csv").open()))
+    last_v15 = v15_history[-1]
+    assert float(last_v15["train_clip_loss"]) > 0
+    assert float(last_v15["train_clip_positive_cells"]) > 0
+    assert float(last_v15["train_clip_unknown_negative_cells"]) > 0
+    assert float(last_v15["train_clip_matrix_cells"]) == (
+        float(last_v15["train_clip_positive_cells"])
+        + float(last_v15["train_clip_explicit_negative_cells"])
+        + float(last_v15["train_clip_unknown_negative_cells"])
+    )
+    v15_scope = json.loads(
+        (v15_run / "evaluation" / "evaluation_scope.json").read_text()
+    )
+    assert v15_scope["clip_style_unknown_supervision"] == {
+        "enabled": True,
+        "interpretation": "experimental_clip_style_unknown_negatives",
+        "known_positive_mask": "all_direction_equivalent_train_positives",
+        "loss": "symmetric_multi_positive_infonce",
+        "loss_weight": 1.0,
+        "matrix": "unique_batch_proteins_x_unique_batch_dnas",
+        "negative_denominator": "explicit_negatives_and_all_unknown_cells",
+        "retains_v1_3_supervised_bce_and_protein_ranking": True,
+        "reverse_complement_dnas_in_matrix": True,
+    }
+    generated_v15 = generate_report(v15_run)
+    assert (v15_run / "figures" / "clip_style_diagnostics.png") in generated_v15
+
     ensemble_output = tmp_path / "ensemble_eval"
     ensemble_result = evaluate_full_library_ensemble(
         checkpoint_paths=[

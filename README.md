@@ -5,9 +5,11 @@ RecRank V1 是一个重组酶–DNA 双塔检索系统。输入一条目标 DNA�
 ## V1 的边界
 
 - `attP` 与 `attB` 都是同一蛋白的合法正 DNA，不做二者分类。
-- 只使用数据库明确给出的正负 pair；未标注组合保持 unknown，不自动作为负样本。
+- 主线模型只使用数据库明确给出的正负 pair；未标注组合保持 unknown，不自动作为负样本。
+  V1.5 是专门检验该假设的独立伪负样本对照，不改变 unknown 的生物学语义。
 - 不分析识别区域、`center_common` 或切割位点。
-- 不使用 CLIP 批内非对角负样本、InfoNCE、ranking loss、hard-negative mining 或局部精排器。
+- V1 主线不使用 CLIP 批内非对角负样本、InfoNCE、hard-negative mining 或局部精排器；
+  V1.1 以后包含明确标注 pair 的 ranking，V1.5 另做 CLIP-style 对照。
 - ESM-2 与 Nucleotide Transformer backbone 冻结并预计算；只训练两个投影头、`gamma` 和 bias。
 - 推理排序只使用原始 cosine；`gamma` 与 bias 只服务于训练时 BCE 的尺度。
 
@@ -336,3 +338,27 @@ consistency、cosine scheduler及降低学习率均未启用，因此这次实�
 ```bash
 sbatch --export=ALL,SEED=42 scripts/slurm_train_v1_4_dna_ranking.sh
 ```
+
+## V1.5-clip-style：batch 内全部 unknown 作为负样本
+
+V1.5 从当前最佳单模型基线 V1.3 出发，不继承 V1.4 的 DNA-centric ranking。
+每个 batch 仍先由原 sampler 选出 128 个 protein group 及其显式 pair，并追加全部
+反向互补 DNA；然后对 batch 内 unique protein × unique DNA 构造完整 cosine 矩阵。
+训练集所有已知正关系及其方向等价项组成 multi-positive mask，其余矩阵单元——包括
+显式负样本和所有 unknown——全部进入 softmax 分母作为负样本。
+
+新增目标是权重 1.0 的对称 multi-positive InfoNCE，同时保留 V1.3 的显式 pair BCE
+和 0.25 protein-centric hinge ranking。因此相对 V1.3 的新增假设只有“batch 内
+unknown 可以当负样本”；attP、attB、同 DNA 多正蛋白以及 RC 正例不会被当成负样本。
+没有 batch 内正样本的行或列仍作为候选负样本，但不单独作为 query 计算交叉熵。
+
+该版本是诊断性对照，不能把 unknown 解释为已验证无活性。`evaluation_scope.json`
+记录完整实验定义，训练日志记录每轮完整矩阵的已知正、显式负、unknown 单元数，以及
+双向 InfoNCE 和三类 cosine；报告新增 `clip_style_diagnostics.png`。
+
+```bash
+sbatch --export=ALL,SEED=43 scripts/slurm_train_v1_5_clip_style.sh
+```
+
+首轮固定使用 seed 43，与当前最佳的 V1.3 seed 43 做单变量比较；在看到明确收益前不补
+seed 42/44。

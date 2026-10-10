@@ -15,6 +15,7 @@ from rec_rank.training import (
     dna_centric_ranking_loss,
     explicit_ranking_loss,
     grouped_protein_ranking_loss,
+    multi_positive_clip_loss,
     reverse_complement_consistency_loss,
 )
 from rec_rank.utils import read_tsv
@@ -197,6 +198,48 @@ def test_explicit_ranking_loss_and_novel_checkpoint_selection() -> None:
         "earlier_epoch",
     ]
     assert _is_better(candidate, 3, best, order)
+
+
+def test_multi_positive_clip_loss_uses_full_cross_matrix_and_unknowns() -> None:
+    torch.manual_seed(19)
+    model = RecRankModel(
+        protein_dim=4,
+        dna_dim=3,
+        hidden_dim=8,
+        projection_dim=5,
+        dropout=0.0,
+    )
+    protein_store = EmbeddingStore(
+        keys=["P1", "P2"],
+        embeddings=torch.randn(2, 4),
+        manifest={},
+    )
+    dna_store = EmbeddingStore(
+        keys=["D1", "D2", "D3"],
+        embeddings=torch.randn(3, 3),
+        manifest={},
+    )
+    loss, stats = multi_positive_clip_loss(
+        model,
+        ["P1", "P2", "P1"],
+        ["D1", "D2", "D3", "D2"],
+        protein_store,
+        dna_store,
+        {"P1": {"D1", "D2"}, "P2": {"D2"}},
+        {"P1": {"D3"}},
+        torch.device("cpu"),
+    )
+    assert torch.isfinite(loss)
+    assert stats["matrix_cells"] == 6
+    assert stats["positive_cells"] == 3
+    assert stats["explicit_negative_cells"] == 1
+    assert stats["unknown_negative_cells"] == 2
+    assert stats["active_proteins"] == 2
+    assert stats["active_dnas"] == 2
+    loss.backward()
+    assert model.raw_gamma.grad is not None
+    assert next(model.protein_projection.parameters()).grad is not None
+    assert next(model.dna_projection.parameters()).grad is not None
 
 
 def test_v12_group_balanced_dna_ranking_and_rc_consistency() -> None:
