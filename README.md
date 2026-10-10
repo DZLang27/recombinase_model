@@ -252,3 +252,87 @@ TEST_RC_JOB=$(sbatch --parsable scripts/slurm_precompute.sh dna \
 sbatch --dependency=afterok:${TRAIN_RC_JOB}:${TEST_RC_JOB} \
   --export=ALL,SEED=42 scripts/slurm_train_v1_1.sh
 ```
+
+## V1.2-frozen：面向实际检索方向的显式排序
+
+V1.2-frozen 继续冻结 ESM-2 和 Nucleotide Transformer backbone，沿用 V1.1 的
+embedding cache、完整 38,502 蛋白候选库、方向不变 truth 和 novel-DNA
+Recall@10 checkpoint 选择规则。它不使用 unknown pair，也不引入局部交互模型。
+
+新增的训练信号为：
+
+- protein-centric smooth margin ranking，并按蛋白先做组内平均；
+- DNA-centric smooth margin ranking：对同一 DNA，只比较明确标注的正蛋白和
+  负蛋白；
+- DNA 与其反向互补序列在投影空间中的 cosine consistency；
+- 原始监督 pair 和全部反向互补副本仍共同参与 BCE。
+
+当前真实训练数据可以构造 2,314 个 DNA ranking group、3,979 个显式正 pair、
+2,453 个显式负 pair和 4,628 个合法正负 triplet。先重新 prepare 生成审计文件
+`train_dna_ranking_groups.jsonl`：
+
+```bash
+rec-rank prepare --config configs/v1_2_frozen.yaml
+```
+
+这一步不会改变序列 key，也不需要重算现有 backbone embedding。随后提交 seed 42：
+
+```bash
+sbatch --export=ALL,SEED=42 scripts/slurm_train_v1_2_frozen.sh
+```
+
+V1.2-frozen 的结构化日志额外记录 DNA-centric ranking loss、有效比较数、正负
+margin、RC consistency loss 和 DNA/RC embedding cosine。报告同时显示
+novel-DNA Recall@10 的比例与实际命中数，避免只用相对提升描述绝对性能。
+
+## V1.3-projection：回到 V1.1，仅增强投影头
+
+V1.3-projection 保留 V1.1 的全部训练与评价定义：相同的 protein-centric hinge
+ranking、BCE 权重、batch sampler、全量反向互补追加、完整 38,502 蛋白候选库和
+novel-DNA Recall@10 best-checkpoint 规则。它不包含 V1.2-frozen 的 smooth ranking、
+DNA-centric ranking、RC consistency 或 cosine scheduler，因此与 V1.1 的主要变量
+只有投影头容量。
+
+蛋白和 DNA 使用两个参数相互独立、结构相同且学习率相同的投影头。每个投影头为
+`输入 LayerNorm → Linear(输入维度, 512) → 2 个残差 MLP block → LayerNorm → L2`
+；每个 block 为 `Pre-LN → Linear(512, 1024) → GELU → Dropout →
+Linear(1024, 512) → Dropout → LayerScale(初值 0.1) → residual add`。共同 cosine
+空间由 256 维扩为 512 维。两个 backbone 仍冻结，继续复用现有 embedding cache，
+不需要重新计算 embedding。
+
+提交 seed 42：
+
+```bash
+sbatch --export=ALL,SEED=42 scripts/slurm_train_v1_3_projection.sh
+```
+
+三个 seed 训练完成后，可以在同一完整候选库上对每个 DNA–蛋白 cosine score 取
+算术平均，再统一执行 dense ranking。ensemble 不平均投影向量，也不使用测试标签
+调整权重；三个 checkpoint 的权重固定为 `1/3`：
+
+```bash
+sbatch scripts/slurm_evaluate_v1_3_ensemble.sh
+```
+
+默认输出到 `evaluations/v1_3_seed_42_43_44_ensemble/`，其中记录三个 checkpoint
+的绝对路径、SHA256、seed、epoch、聚合规则、完整库指纹、逐 query rank 与 dense
+TOP10，避免把 ensemble 结果与单 checkpoint 结果混淆。
+
+## V1.4-dna-ranking：单变量检索方向监督
+
+V1.4 完整保留 V1.3 的残差投影头及训练、评价设置，只新增权重为 0.1 的
+DNA-centric hinge ranking。对同一 DNA，仅在数据中有明确标签的正蛋白和负蛋白
+之间构造 `max(0, 0.1 - cosine_pos + cosine_neg)`；unknown protein–DNA pair 永远
+不作为负样本。原序列与追加的反向互补序列都参与该约束。
+
+每个 epoch 对 2,314 个合法 DNA group 各使用一次，共包含 3,979 个显式正 pair、
+2,453 个显式负 pair和4,628个正负 triplet。每个主训练 step 配8个 DNA group，
+恰好覆盖约290个 batch。V1.2 的 smooth loss、protein group balancing、RC
+consistency、cosine scheduler及降低学习率均未启用，因此这次实验只检验与实际
+`DNA → protein ranking` 方向一致的轻量监督是否有效。
+
+先运行 seed 42：
+
+```bash
+sbatch --export=ALL,SEED=42 scripts/slurm_train_v1_4_dna_ranking.sh
+```

@@ -9,7 +9,10 @@ import torch
 
 from rec_rank.data import prepare_data
 from rec_rank.embeddings import load_embedding_store, save_embedding_store
-from rec_rank.full_library import evaluate_full_library_checkpoints
+from rec_rank.full_library import (
+    evaluate_full_library_checkpoints,
+    evaluate_full_library_ensemble,
+)
 from rec_rank.reporting import generate_report
 from rec_rank.screening import build_candidate_index, screen
 from rec_rank.training import train
@@ -54,6 +57,9 @@ def test_synthetic_training_checkpoint_index_and_screen(tmp_path: Path) -> None:
     rows = [
         _raw_row(1, "MKTAA", ["AAAA", "CCCC", "GGGG", "TTTT"]),
         _raw_row(2, "MKTVV", ["ACAC", "CACA", "GTGT", "TGTG"]),
+        # 同一 DNA 在不同蛋白下拥有显式正、负标注，使 V1.2 可以构造
+        # DNA-centric ranking；这些序列的反向互补也都已出现在主 cache。
+        _raw_row(3, "MKLGG", ["GGGG", "TTTT", "AAAA", "CCCC"]),
     ]
     _write(train_raw, rows)
     _write(test_raw, rows)
@@ -159,7 +165,7 @@ def test_synthetic_training_checkpoint_index_and_screen(tmp_path: Path) -> None:
         query_batch_size=2,
         top_k=1,
     )
-    assert full_results[0]["candidate_count"] == 2
+    assert full_results[0]["candidate_count"] == 3
     assert (full_output / "comparison.tsv").exists()
     assert (full_output / "evaluation_scope.json").exists()
     assert (full_output / full_results[0]["label"] / "metrics.json").exists()
@@ -200,9 +206,88 @@ def test_synthetic_training_checkpoint_index_and_screen(tmp_path: Path) -> None:
     assert float(v11_history[-1]["train_rc_augmentation_fraction"]) == 1.0
     assert float(v11_history[-1]["train_rc_added_pairs"]) > 0
     v11_best = json.loads((v11_run / "evaluation" / "best_metrics.json").read_text())
-    assert v11_best["metrics"]["candidates"] == 2
+    assert v11_best["metrics"]["candidates"] == 3
     assert "exact_recall_at_10" in v11_best["metrics"]
     v11_scope = json.loads(
         (v11_run / "evaluation" / "evaluation_scope.json").read_text()
     )
-    assert v11_scope["candidate_count"] == 2
+    assert v11_scope["candidate_count"] == 3
+
+    v12_config = copy.deepcopy(v11_config)
+    v12_config["model"]["version"] = "v1.2-frozen"
+    v12_config["training"].update(
+        {
+            "protein_ranking_loss_type": "smooth",
+            "protein_ranking_group_balanced": True,
+            "dna_ranking_loss_weight": 1.0,
+            "dna_ranking_margin": 0.1,
+            "dna_ranking_loss_type": "smooth",
+            "dna_ranking_queries_per_batch": 8,
+            "dna_ranking_use_reverse_complement": True,
+            "rc_consistency_loss_weight": 0.1,
+        }
+    )
+    v12_config["runtime"]["run_root"] = str(tmp_path / "runs_v12")
+    v12_run = train(v12_config, torch.device("cpu"))
+    v12_history = list(csv.DictReader((v12_run / "logs" / "history.csv").open()))
+    assert float(v12_history[-1]["train_dna_ranking_groups"]) == 4
+    assert float(v12_history[-1]["train_dna_ranking_triplets"]) == 4
+    assert float(v12_history[-1]["train_dna_ranking_comparisons"]) == 8
+    assert float(v12_history[-1]["train_dna_ranking_loss"]) > 0
+    assert float(v12_history[-1]["train_rc_consistency_loss"]) >= 0
+    v12_scope = json.loads(
+        (v12_run / "evaluation" / "evaluation_scope.json").read_text()
+    )
+    assert v12_scope["dna_ranking_supervision"]["query_count"] == 4
+    assert v12_scope["dna_ranking_supervision"]["unknown_pairs_used_as_negatives"] is False
+    generated_v12 = generate_report(v12_run)
+    assert (v12_run / "figures" / "dna_ranking_and_rc_consistency.png") in generated_v12
+
+    # V1.3 returns to the exact V1.1 objective and changes only the two
+    # independent projection heads. Exercise config -> checkpoint -> reload.
+    v13_config = copy.deepcopy(v11_config)
+    v13_config["model"].update(
+        {
+            "version": "v1.3-projection",
+            "projection_head_type": "residual",
+            "projection_hidden_dim": 6,
+            "projection_dim": 6,
+            "projection_residual_blocks": 2,
+            "projection_expansion_dim": 12,
+            "projection_layer_scale_init": 0.1,
+        }
+    )
+    v13_config["runtime"]["run_root"] = str(tmp_path / "runs_v13")
+    v13_run = train(v13_config, torch.device("cpu"))
+    v13_checkpoint = torch.load(
+        v13_run / "checkpoints" / "best.pt",
+        map_location="cpu",
+        weights_only=False,
+    )
+    assert v13_checkpoint["model_architecture"]["projection_head_type"] == "residual"
+    assert v13_checkpoint["model_architecture"]["projection_dim"] == 6
+    assert len(v13_checkpoint["model_state"]["protein_projection.blocks.0.layer_scale"]) == 6
+
+    ensemble_output = tmp_path / "ensemble_eval"
+    ensemble_result = evaluate_full_library_ensemble(
+        checkpoint_paths=[
+            v11_run / "checkpoints" / "best.pt",
+            v13_run / "checkpoints" / "best.pt",
+        ],
+        train_candidate_cache=embeddings / "train_p",
+        test_candidate_cache=full_eval_test_cache,
+        query_cache=embeddings / "test_d",
+        processed_dir=processed,
+        output_dir=ensemble_output,
+        device=torch.device("cpu"),
+        query_batch_size=2,
+        top_k=1,
+    )
+    assert ensemble_result["checkpoint_count"] == 2
+    assert ensemble_result["aggregation"] == (
+        "arithmetic_mean_of_per_checkpoint_cosine_scores"
+    )
+    assert ensemble_result["direction_invariant_truth"]["candidates"] == 3
+    assert (ensemble_output / "metrics.json").exists()
+    assert (ensemble_output / "query_metrics_direction_invariant.tsv").exists()
+    assert (ensemble_output / "dense_top1.tsv").exists()
