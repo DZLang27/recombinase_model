@@ -407,6 +407,146 @@ def evaluate_model_full_library(
     )
 
 
+def evaluate_models_full_library_ensemble(
+    models: list[torch.nn.Module],
+    candidates: EmbeddingStore,
+    query_store: EmbeddingStore,
+    query_keys: list[str],
+    exact_truth: dict[str, set[str]],
+    direction_truth: dict[str, set[str]],
+    query_metadata: dict[str, dict[str, str]],
+    candidate_metadata: dict[str, dict[str, str]],
+    device: torch.device,
+    recall_ks: tuple[int, ...] = (1, 5, 10),
+    query_batch_size: int = 64,
+    top_k: int = 10,
+    query_rc_store: EmbeddingStore | None = None,
+    query_rc_map: dict[str, str] | None = None,
+    ensemble_id: str = "ensemble",
+) -> FullLibraryEvaluation:
+    """Average per-checkpoint cosine scores, then perform one dense ranking."""
+    if not models:
+        raise ValueError("ensemble 至少需要一个模型")
+    if query_batch_size <= 0 or top_k <= 0:
+        raise ValueError("query_batch_size 和 top_k 必须大于 0")
+    if not query_store.contains_all(query_keys):
+        raise ValueError("测试 DNA embedding cache 缺少 retrieval query")
+
+    candidate_keys = candidates.keys
+    candidate_index = {key: index for index, key in enumerate(candidate_keys)}
+    for name, truth in (("exact", exact_truth), ("direction-invariant", direction_truth)):
+        missing = set().union(*(truth[key] for key in query_keys)) - candidate_index.keys()
+        if missing:
+            raise ValueError(f"{name} truth 中有蛋白不在完整候选库: {sorted(missing)[:3]}")
+
+    candidate_vector_sets: list[torch.Tensor] = []
+    query_vector_sets: list[torch.Tensor] = []
+    rc_keys = [query_rc_map[key] for key in query_keys] if query_rc_map else None
+    if rc_keys is not None:
+        if query_rc_store is None:
+            raise ValueError("启用反向互补 ensemble 时必须提供 query_rc_store")
+        if not query_rc_store.contains_all(rc_keys):
+            raise ValueError("反向互补 DNA embedding cache 缺少 retrieval query")
+
+    for model in models:
+        candidate_vectors = project_store(model, candidates, candidate_keys, "protein", device)
+        query_vectors = project_store(model, query_store, query_keys, "dna", device)
+        if rc_keys is not None and query_rc_store is not None:
+            rc_vectors = project_store(model, query_rc_store, rc_keys, "dna", device)
+            query_vectors = F.normalize(query_vectors + rc_vectors, p=2, dim=-1)
+        candidate_vector_sets.append(
+            candidate_vectors.to(device=device, dtype=torch.float32)
+        )
+        query_vector_sets.append(query_vectors)
+
+    exact_rows: list[dict[str, Any]] = []
+    direction_rows: list[dict[str, Any]] = []
+    top_rows: list[dict[str, Any]] = []
+    library_id = sha256_text(canonical_json(candidates.manifest))[:20]
+    with torch.inference_mode():
+        for start in range(0, len(query_keys), query_batch_size):
+            batch_keys = query_keys[start : start + query_batch_size]
+            batch_scores_device = torch.zeros(
+                (len(batch_keys), len(candidate_keys)),
+                device=device,
+                dtype=torch.float32,
+            )
+            for query_vectors, candidate_vectors in zip(
+                query_vector_sets, candidate_vector_sets, strict=True
+            ):
+                batch_queries = query_vectors[start : start + query_batch_size].to(
+                    device=device, dtype=torch.float32
+                )
+                batch_scores_device.add_(batch_queries @ candidate_vectors.T)
+            batch_scores_device.div_(len(models))
+            batch_ranks_device = dense_rank_descending(batch_scores_device)
+            batch_scores = batch_scores_device.cpu()
+            batch_ranks = batch_ranks_device.cpu()
+            for local_index, query_key in enumerate(batch_keys):
+                exact_rows.append(
+                    _query_row(
+                        local_index,
+                        query_key,
+                        batch_scores,
+                        batch_ranks,
+                        exact_truth,
+                        candidate_keys,
+                        candidate_index,
+                        query_metadata,
+                    )
+                )
+                direction_rows.append(
+                    _query_row(
+                        local_index,
+                        query_key,
+                        batch_scores,
+                        batch_ranks,
+                        direction_truth,
+                        candidate_keys,
+                        candidate_index,
+                        query_metadata,
+                    )
+                )
+                selected = torch.nonzero(
+                    batch_ranks[local_index] <= top_k, as_tuple=False
+                ).flatten()
+                selected = selected[
+                    torch.argsort(
+                        batch_scores[local_index, selected], descending=True, stable=True
+                    )
+                ]
+                for candidate_value in selected.tolist():
+                    protein_key = candidate_keys[candidate_value]
+                    metadata = candidate_metadata.get(protein_key, {})
+                    top_rows.append(
+                        {
+                            "query_id": query_key,
+                            "query_sequence": query_metadata[query_key].get("sequence", ""),
+                            "protein_key": protein_key,
+                            "protein_record_ids": metadata.get("record_ids", ""),
+                            "protein_cluster_ids": metadata.get("cluster_ids", ""),
+                            "candidate_source": metadata.get("candidate_source", ""),
+                            "cosine": float(
+                                batch_scores[local_index, candidate_value].item()
+                            ),
+                            "dense_rank": int(
+                                batch_ranks[local_index, candidate_value].item()
+                            ),
+                            "checkpoint_id": ensemble_id,
+                            "candidate_library_id": library_id,
+                        }
+                    )
+            del batch_scores_device, batch_ranks_device, batch_scores, batch_ranks
+
+    return FullLibraryEvaluation(
+        exact_metrics=_metrics_from_rows(exact_rows, len(candidate_keys), recall_ks),
+        direction_metrics=_metrics_from_rows(direction_rows, len(candidate_keys), recall_ks),
+        exact_rows=exact_rows,
+        direction_rows=direction_rows,
+        top_rows=top_rows,
+    )
+
+
 def _evaluate_one(
     checkpoint_path: Path,
     candidates: EmbeddingStore,
@@ -672,3 +812,220 @@ def evaluate_full_library_checkpoints(
     write_tsv(output / "comparison.tsv", summary_rows, summary_fields)
     atomic_json_dump(output / "comparison.json", {"scope": audit, "results": results})
     return results
+
+
+def evaluate_full_library_ensemble(
+    checkpoint_paths: list[str | Path],
+    train_candidate_cache: str | Path,
+    test_candidate_cache: str | Path,
+    query_cache: str | Path,
+    processed_dir: str | Path,
+    output_dir: str | Path,
+    device: torch.device,
+    query_batch_size: int = 64,
+    top_k: int = 10,
+    query_rc_cache: str | Path | None = None,
+) -> dict[str, Any]:
+    """Evaluate an arithmetic mean of cosine scores from multiple checkpoints."""
+    if len(checkpoint_paths) < 2:
+        raise ValueError("ensemble 至少需要两个 checkpoint")
+    if query_batch_size <= 0 or top_k <= 0:
+        raise ValueError("query_batch_size 和 top_k 必须大于 0")
+
+    started = time.perf_counter()
+    processed = Path(processed_dir)
+    output = Path(output_dir)
+    output.mkdir(parents=True, exist_ok=True)
+    candidates, candidate_audit = _merge_candidate_stores(
+        train_candidate_cache, test_candidate_cache
+    )
+    query_store = load_embedding_store(query_cache)
+    query_keys, exact_truth, direction_truth, query_metadata, truth_audit = _build_truths(
+        processed
+    )
+    metadata = _candidate_metadata(processed)
+    if set(candidates.keys) != set(metadata):
+        raise ValueError("完整候选 embedding 与蛋白元数据的 key 集合不一致")
+
+    loaded: list[tuple[str, Path, dict[str, Any]]] = []
+    for checkpoint_value in checkpoint_paths:
+        checkpoint_path = Path(checkpoint_value)
+        checkpoint = load_checkpoint(checkpoint_path, device="cpu")
+        loaded.append((sha256_file(checkpoint_path), checkpoint_path, checkpoint))
+    loaded.sort(key=lambda item: item[0])
+    checkpoint_shas = [item[0] for item in loaded]
+    if len(set(checkpoint_shas)) != len(checkpoint_shas):
+        raise ValueError("ensemble checkpoint 存在内容完全相同的重复项")
+
+    rc_modes = {
+        bool(
+            checkpoint.get("resolved_config", {})
+            .get("evaluation", {})
+            .get("reverse_complement_ensemble", False)
+        )
+        for _, _, checkpoint in loaded
+    }
+    if len(rc_modes) != 1:
+        raise ValueError("ensemble checkpoint 的反向互补推理设置不一致")
+    use_rc = rc_modes.pop()
+
+    checkpoint_rows: list[dict[str, Any]] = []
+    models: list[torch.nn.Module] = []
+    for checkpoint_sha, checkpoint_path, checkpoint in loaded:
+        architecture = checkpoint["model_architecture"]
+        if candidates.embeddings.shape[1] != int(architecture["protein_dim"]):
+            raise ValueError(f"候选蛋白维度与 checkpoint 不一致: {checkpoint_path}")
+        if query_store.embeddings.shape[1] != int(architecture["dna_dim"]):
+            raise ValueError(f"DNA query 维度与 checkpoint 不一致: {checkpoint_path}")
+        fingerprints = checkpoint.get("fingerprints", {})
+        for field in ("model", "resolved_revision", "pooling", "normalization_version"):
+            expected_protein = fingerprints.get("train_protein_cache", {}).get(field)
+            actual_protein = candidates.manifest.get(field)
+            if (
+                expected_protein is not None
+                and actual_protein is not None
+                and expected_protein != actual_protein
+            ):
+                raise ValueError(
+                    f"完整候选库的 {field} 与 checkpoint 不一致: {checkpoint_path}"
+                )
+            expected_dna = fingerprints.get("test_dna_cache", {}).get(field)
+            actual_dna = query_store.manifest.get(field)
+            if (
+                expected_dna is not None
+                and actual_dna is not None
+                and expected_dna != actual_dna
+            ):
+                raise ValueError(
+                    f"测试 DNA cache 的 {field} 与 checkpoint 不一致: {checkpoint_path}"
+                )
+        models.append(model_from_checkpoint(checkpoint, device))
+        checkpoint_rows.append(
+            {
+                "path": str(checkpoint_path.resolve()),
+                "sha256": checkpoint_sha,
+                "epoch": int(checkpoint["epoch"]),
+                "seed": checkpoint.get("resolved_config", {})
+                .get("training", {})
+                .get("seed"),
+                "model_architecture": architecture,
+            }
+        )
+
+    checkpoint_set_id = sha256_text(canonical_json(checkpoint_shas))[:20]
+    ensemble_id = f"mean_cosine_{checkpoint_set_id}"
+    query_rc_map: dict[str, str] | None = None
+    query_rc_store: EmbeddingStore | None = None
+    if use_rc:
+        query_rc_map = {
+            row["dna_key"]: row["reverse_complement_dna_key"]
+            for row in read_tsv(processed / "test_queries_rc_map.tsv")
+        }
+        query_rc_store = query_store
+        missing = set(query_rc_map.values()) - set(query_store.keys)
+        if missing:
+            rc_cache_path = query_rc_cache
+            if rc_cache_path is None:
+                rc_cache_path = (
+                    loaded[0][2]
+                    .get("resolved_config", {})
+                    .get("runtime", {})
+                    .get("test_query_rc_embedding_cache")
+                )
+            if not rc_cache_path:
+                raise ValueError("ensemble 评价缺少反向互补 query embedding cache")
+            rc_only_store = load_embedding_store(rc_cache_path)
+            query_rc_store = merge_embedding_stores(
+                [query_store, rc_only_store], ["test_dna", "test_query_rc"]
+            )
+
+    result = evaluate_models_full_library_ensemble(
+        models=models,
+        candidates=candidates,
+        query_store=query_store,
+        query_keys=query_keys,
+        exact_truth=exact_truth,
+        direction_truth=direction_truth,
+        query_metadata=query_metadata,
+        candidate_metadata=metadata,
+        device=device,
+        recall_ks=(1, 5, 10),
+        query_batch_size=query_batch_size,
+        top_k=top_k,
+        query_rc_store=query_rc_store,
+        query_rc_map=query_rc_map,
+        ensemble_id=ensemble_id,
+    )
+
+    library_id = sha256_text(canonical_json(candidates.manifest))[:20]
+    payload = {
+        "completed_at": utc_now_iso(),
+        "ensemble_id": ensemble_id,
+        "aggregation": "arithmetic_mean_of_per_checkpoint_cosine_scores",
+        "checkpoint_count": len(checkpoint_rows),
+        "checkpoints": checkpoint_rows,
+        "candidate_library_id": library_id,
+        "candidate_count": len(candidates.keys),
+        "query_count": len(query_keys),
+        "query_batch_size": query_batch_size,
+        "reverse_complement_ensemble": use_rc,
+        "elapsed_seconds": time.perf_counter() - started,
+        "exact_truth": result.exact_metrics,
+        "direction_invariant_truth": result.direction_metrics,
+    }
+    scope = {
+        "created_at": utc_now_iso(),
+        "aggregation": payload["aggregation"],
+        "ensemble_id": ensemble_id,
+        "checkpoints": checkpoint_rows,
+        "candidate_library": candidate_audit,
+        "truth": truth_audit,
+        "query_count": len(query_keys),
+        "novel_dna_query_count": sum(
+            int(query_metadata[key].get("is_novel_dna", "0")) for key in query_keys
+        ),
+        "reverse_complement_ensemble": use_rc,
+    }
+    atomic_json_dump(output / "evaluation_scope.json", scope)
+    atomic_json_dump(output / "metrics.json", payload)
+    write_tsv(
+        output / "candidate_library.tsv",
+        (metadata[key] for key in candidates.keys),
+        ["protein_key", "record_ids", "cluster_ids", "candidate_source"],
+    )
+    write_tsv(output / "query_metrics_exact.tsv", result.exact_rows, QUERY_FIELDS)
+    write_tsv(
+        output / "query_metrics_direction_invariant.tsv",
+        result.direction_rows,
+        QUERY_FIELDS,
+    )
+    write_tsv(
+        output / "recall_curve_exact.tsv",
+        recall_curve(result.exact_rows, 50),
+        ["k", "recall"],
+    )
+    write_tsv(
+        output / "recall_curve_direction_invariant.tsv",
+        recall_curve(result.direction_rows, 50),
+        ["k", "recall"],
+    )
+    write_tsv(
+        output / f"dense_top{top_k}.tsv",
+        result.top_rows,
+        [
+            "query_id",
+            "query_sequence",
+            "protein_key",
+            "protein_record_ids",
+            "protein_cluster_ids",
+            "candidate_source",
+            "cosine",
+            "dense_rank",
+            "checkpoint_id",
+            "candidate_library_id",
+        ],
+    )
+    del models
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+    return payload

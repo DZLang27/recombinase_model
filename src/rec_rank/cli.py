@@ -7,7 +7,7 @@ from typing import Any
 
 from .data import prepare_data
 from .embeddings import precompute_embeddings
-from .full_library import evaluate_full_library_checkpoints
+from .full_library import evaluate_full_library_checkpoints, evaluate_full_library_ensemble
 from .reporting import generate_report
 from .screening import build_candidate_index, evaluate_checkpoint, screen
 from .training import train
@@ -101,6 +101,30 @@ def build_parser() -> argparse.ArgumentParser:
     full_evaluate_parser.add_argument("--device", default="cuda")
     full_evaluate_parser.add_argument("--query-batch-size", type=int, default=64)
     full_evaluate_parser.add_argument("--top-k", type=int, default=10)
+
+    ensemble_parser = subparsers.add_parser(
+        "evaluate-full-library-ensemble",
+        help="在完整蛋白库上评价多个 checkpoint 的 cosine score 均值 ensemble",
+    )
+    ensemble_parser.add_argument(
+        "--checkpoint",
+        action="append",
+        required=True,
+        help="至少重复提供两次；对各 checkpoint 的 cosine score 取算术平均",
+    )
+    ensemble_parser.add_argument(
+        "--train-candidate-embeddings", default="embeddings/train_proteins"
+    )
+    ensemble_parser.add_argument(
+        "--test-candidate-embeddings", default="embeddings/test_candidates"
+    )
+    ensemble_parser.add_argument("--query-embeddings", default="embeddings/test_dnas")
+    ensemble_parser.add_argument("--query-rc-embeddings")
+    ensemble_parser.add_argument("--processed-dir", default="data/processed")
+    ensemble_parser.add_argument("--output", required=True)
+    ensemble_parser.add_argument("--device", default="cuda")
+    ensemble_parser.add_argument("--query-batch-size", type=int, default=64)
+    ensemble_parser.add_argument("--top-k", type=int, default=10)
 
     for command in ("export", "build-index"):
         export_parser = subparsers.add_parser(command, help="用 best checkpoint 构建版本化候选蛋白索引")
@@ -222,6 +246,22 @@ def main(argv: list[str] | None = None) -> None:
             for result in results
         ]
         print(json.dumps(compact, ensure_ascii=False, indent=2))
+        return
+
+    if args.command == "evaluate-full-library-ensemble":
+        result = evaluate_full_library_ensemble(
+            checkpoint_paths=args.checkpoint,
+            train_candidate_cache=args.train_candidate_embeddings,
+            test_candidate_cache=args.test_candidate_embeddings,
+            query_cache=args.query_embeddings,
+            processed_dir=args.processed_dir,
+            output_dir=args.output,
+            device=resolve_device(args.device),
+            query_batch_size=args.query_batch_size,
+            top_k=args.top_k,
+            query_rc_cache=args.query_rc_embeddings,
+        )
+        print(json.dumps(result, ensure_ascii=False, indent=2))
         return
 
     if args.command in {"export", "build-index"}:
