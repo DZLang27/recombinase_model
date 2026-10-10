@@ -726,6 +726,16 @@ def train(
         dropout=float(model_cfg["dropout"]),
         gamma_init=float(model_cfg["gamma_init"]),
         gamma_epsilon=float(model_cfg["gamma_epsilon"]),
+        projection_head_type=str(model_cfg.get("projection_head_type", "legacy")),
+        projection_residual_blocks=int(model_cfg.get("projection_residual_blocks", 2)),
+        projection_expansion_dim=(
+            int(model_cfg["projection_expansion_dim"])
+            if model_cfg.get("projection_expansion_dim") is not None
+            else None
+        ),
+        projection_layer_scale_init=float(
+            model_cfg.get("projection_layer_scale_init", 0.1)
+        ),
     ).to(device)
     projection_parameters = [
         *model.protein_projection.parameters(),
