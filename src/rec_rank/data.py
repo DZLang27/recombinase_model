@@ -66,6 +66,18 @@ class Membership:
     source_rows: tuple[int, ...]
 
 
+@dataclass(frozen=True)
+class RawTriple:
+    """One intact supervision record from the source table."""
+
+    source_row: int
+    protein_key: str
+    attp_pos_key: str
+    attb_pos_key: str
+    attp_neg_key: str
+    attb_neg_key: str
+
+
 def _collect_dataset(path: str | Path) -> dict[str, Any]:
     protein_sequences: dict[str, str] = {}
     dna_sequences: dict[str, str] = {}
@@ -74,6 +86,7 @@ def _collect_dataset(path: str | Path) -> dict[str, Any]:
     protein_ids: dict[str, set[str]] = defaultdict(set)
     raw_rows = 0
     invalid_slots = 0
+    raw_triples: list[RawTriple] = []
 
     for source_row, row in enumerate(read_tsv(path), start=2):
         raw_rows += 1
@@ -89,6 +102,7 @@ def _collect_dataset(path: str | Path) -> dict[str, Any]:
         if record_id:
             protein_ids[protein_key].add(record_id)
 
+        row_dna_keys: dict[str, str] = {}
         for column, category, label in DNA_COLUMNS:
             dna_sequence = normalize_dna(row.get(column))
             if dna_sequence is None:
@@ -96,7 +110,20 @@ def _collect_dataset(path: str | Path) -> dict[str, Any]:
                 continue
             dna_key = stable_key(dna_sequence, "dna")
             dna_sequences[dna_key] = dna_sequence
+            row_dna_keys[category] = dna_key
             memberships[(protein_key, dna_key, category)].add(source_row)
+
+        if all(category in row_dna_keys for category in CATEGORIES):
+            raw_triples.append(
+                RawTriple(
+                    source_row=source_row,
+                    protein_key=protein_key,
+                    attp_pos_key=row_dna_keys["attP_pos"],
+                    attb_pos_key=row_dna_keys["attB_pos"],
+                    attp_neg_key=row_dna_keys["attP_neg"],
+                    attb_neg_key=row_dna_keys["attB_neg"],
+                )
+            )
 
     materialized = [
         Membership(
@@ -115,6 +142,7 @@ def _collect_dataset(path: str | Path) -> dict[str, Any]:
         "protein_sequences": protein_sequences,
         "dna_sequences": dna_sequences,
         "memberships": materialized,
+        "raw_triples": raw_triples,
         "protein_clusters": protein_clusters,
         "protein_ids": protein_ids,
     }
@@ -242,6 +270,19 @@ def prepare_data(train_path: str | Path, test_path: str | Path, output_dir: str 
     ]
     supervised_train_proteins = {item.protein_key for item in train_memberships}
     supervised_train_dnas = {item.dna_key for item in train_memberships}
+    train_triples = [
+        triple
+        for triple in train["raw_triples"]
+        if all(
+            (triple.protein_key, dna_key) not in train_conflicts
+            for dna_key in (
+                triple.attp_pos_key,
+                triple.attb_pos_key,
+                triple.attp_neg_key,
+                triple.attb_neg_key,
+            )
+        )
+    ]
 
     write_tsv(
         output / "train_proteins.tsv",
@@ -303,6 +344,24 @@ def prepare_data(train_path: str | Path, test_path: str | Path, output_dir: str 
             record: dict[str, Any] = {"protein_key": protein_key}
             record.update({category: sorted(grouped[protein_key][category]) for category in CATEGORIES})
             handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+    triples_path = output / "train_triples.jsonl"
+    with triples_path.open("w", encoding="utf-8") as handle:
+        for triple in train_triples:
+            handle.write(
+                json.dumps(
+                    {
+                        "source_row": triple.source_row,
+                        "protein_key": triple.protein_key,
+                        "attp_pos_key": triple.attp_pos_key,
+                        "attb_pos_key": triple.attb_pos_key,
+                        "attp_neg_key": triple.attp_neg_key,
+                        "attb_neg_key": triple.attb_neg_key,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+                + "\n"
+            )
     dna_ranking_summary = _write_dna_ranking_groups(
         output / "train_dna_ranking_groups.jsonl", train_memberships
     )
@@ -407,6 +466,14 @@ def prepare_data(train_path: str | Path, test_path: str | Path, output_dir: str 
         "train_positive_pairs": len(train_positive_pairs),
         "train_negative_pairs": len(train_negative_pairs),
         "train_conflicting_pairs_removed": len(train_conflicts),
+        "train_complete_triples_raw": len(train["raw_triples"]),
+        "train_supervised_triples": len(train_triples),
+        "train_triple_unique_proteins": len(
+            {triple.protein_key for triple in train_triples}
+        ),
+        "train_triples_removed_by_pair_conflict": (
+            len(train["raw_triples"]) - len(train_triples)
+        ),
         **dna_ranking_summary,
         "test_raw_rows": test["raw_rows"],
         "test_unique_candidates": len(test_candidate_keys),

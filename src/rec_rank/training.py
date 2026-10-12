@@ -30,7 +30,11 @@ from .sampler import (
     DnaRankingBatchSampler,
     DnaRankingGroup,
     EpochBatchSampler,
+    TripleEpochBatchSampler,
+    TripleSample,
+    flatten_triple_batch,
     load_dna_ranking_groups,
+    load_triples,
 )
 from .full_library import (
     _build_truths,
@@ -88,6 +92,20 @@ HISTORY_FIELDS = [
     "train_clip_positive_cosine_mean",
     "train_clip_explicit_negative_cosine_mean",
     "train_clip_unknown_negative_cosine_mean",
+    "train_tuple_loss",
+    "train_tuple_protein_to_pair_loss",
+    "train_tuple_pair_to_protein_loss",
+    "train_tuple_matrix_cells",
+    "train_tuple_positive_cells",
+    "train_tuple_unknown_cells",
+    "train_tuple_positive_score_mean",
+    "train_tuple_unknown_score_mean",
+    "train_structured_negative_loss",
+    "train_structured_negative_active_fraction",
+    "train_structured_negative_comparisons",
+    "train_structured_positive_score_mean",
+    "train_structured_corrupted_score_mean",
+    "train_structured_margin_mean",
     "train_positive_loss",
     "train_negative_loss",
     "train_positive_cosine_mean",
@@ -389,6 +407,204 @@ def multi_positive_clip_loss(
         "positive_cosine_sum": masked_sum(positive_mask),
         "explicit_negative_cosine_sum": masked_sum(explicit_negative_mask),
         "unknown_negative_cosine_sum": masked_sum(unknown_negative_mask),
+    }
+
+
+def normalized_softmin(
+    first: torch.Tensor, second: torch.Tensor, temperature: float
+) -> torch.Tensor:
+    """Smooth minimum whose value is unchanged when both inputs are equal."""
+    if temperature <= 0:
+        raise ValueError("triple_softmin_temperature 必须大于 0")
+    stacked = torch.stack((first, second), dim=-1)
+    return -temperature * (
+        torch.logsumexp(-stacked / temperature, dim=-1)
+        - torch.log(torch.tensor(2.0, device=stacked.device, dtype=stacked.dtype))
+    )
+
+
+def _canonical_site_key(dna_key: str, rc_map: dict[str, str]) -> str:
+    return min(dna_key, rc_map[dna_key])
+
+
+def triple_pair_key(triple: TripleSample, rc_map: dict[str, str]) -> tuple[str, str]:
+    """Represent the positive site pair without attP/attB order or strand direction."""
+    first, second = sorted(
+        (
+            _canonical_site_key(triple.attp_pos_key, rc_map),
+            _canonical_site_key(triple.attb_pos_key, rc_map),
+        )
+    )
+    return first, second
+
+
+def _orientation_ensemble_matrix(
+    model: RecRankModel,
+    protein_vectors: torch.Tensor,
+    dna_keys: list[str],
+    dna_store: EmbeddingStore,
+    rc_map: dict[str, str],
+    device: torch.device,
+) -> torch.Tensor:
+    original = model.project_dnas(dna_store.rows(dna_keys, device=device).float())
+    reverse = model.project_dnas(
+        dna_store.rows([rc_map[key] for key in dna_keys], device=device).float()
+    )
+    direction_invariant = F.normalize(original + reverse, p=2, dim=-1)
+    return protein_vectors @ direction_invariant.T
+
+
+def triple_tuple_contrastive_loss(
+    model: RecRankModel,
+    triples: list[TripleSample],
+    protein_store: EmbeddingStore,
+    dna_store: EmbeddingStore,
+    rc_map: dict[str, str],
+    positive_pairs_by_protein: dict[str, set[tuple[str, str]]],
+    device: torch.device,
+    softmin_temperature: float,
+) -> tuple[torch.Tensor, dict[str, float | int]]:
+    """Contrast enzymes against intact, orientation-invariant (attP, attB) pairs."""
+    if not triples:
+        anchor = next(model.parameters())
+        return anchor.sum() * 0.0, {
+            "protein_to_pair_loss": 0.0,
+            "pair_to_protein_loss": 0.0,
+            "matrix_cells": 0,
+            "positive_cells": 0,
+            "unknown_cells": 0,
+            "positive_score_sum": 0.0,
+            "unknown_score_sum": 0.0,
+        }
+    protein_keys = [triple.protein_key for triple in triples]
+    if len(set(protein_keys)) != len(protein_keys):
+        raise ValueError("triple-aware batch 必须保证每个蛋白最多出现一次")
+    protein_vectors = model.project_proteins(
+        protein_store.rows(protein_keys, device=device).float()
+    )
+    attp_scores = _orientation_ensemble_matrix(
+        model,
+        protein_vectors,
+        [triple.attp_pos_key for triple in triples],
+        dna_store,
+        rc_map,
+        device,
+    )
+    attb_scores = _orientation_ensemble_matrix(
+        model,
+        protein_vectors,
+        [triple.attb_pos_key for triple in triples],
+        dna_store,
+        rc_map,
+        device,
+    )
+    joint_scores = normalized_softmin(attp_scores, attb_scores, softmin_temperature)
+
+    candidate_pair_keys = [triple_pair_key(triple, rc_map) for triple in triples]
+    positive_mask_cpu = torch.zeros(
+        (len(triples), len(triples)), dtype=torch.bool
+    )
+    for protein_index, protein_key in enumerate(protein_keys):
+        known_pairs = positive_pairs_by_protein.get(protein_key, set())
+        for pair_index, pair_key in enumerate(candidate_pair_keys):
+            positive_mask_cpu[protein_index, pair_index] = pair_key in known_pairs
+    positive_mask = positive_mask_cpu.to(device=device)
+    row_counts = positive_mask.sum(dim=1)
+    column_counts = positive_mask.sum(dim=0)
+    active_rows = row_counts > 0
+    active_columns = column_counts > 0
+    if not bool(active_rows.all()):
+        raise ValueError("triple-aware batch 存在没有已知正位点对的蛋白")
+    if not bool(active_columns.all()):
+        raise ValueError("triple-aware batch 存在没有已知正蛋白的位点对")
+
+    logits = model.gamma * joint_scores
+    row_targets = positive_mask.to(logits.dtype) / row_counts[:, None].to(logits.dtype)
+    protein_to_pair_loss = -(
+        F.log_softmax(logits, dim=1) * row_targets
+    ).sum(dim=1).mean()
+    column_targets = positive_mask.T.to(logits.dtype) / column_counts[:, None].to(
+        logits.dtype
+    )
+    pair_to_protein_loss = -(
+        F.log_softmax(logits.T, dim=1) * column_targets
+    ).sum(dim=1).mean()
+    loss = 0.5 * (protein_to_pair_loss + pair_to_protein_loss)
+
+    detached = joint_scores.detach().float()
+    unknown_mask = ~positive_mask
+    positive_cells = int(positive_mask_cpu.sum())
+    unknown_cells = int(unknown_mask.sum().detach().cpu())
+    return loss, {
+        "protein_to_pair_loss": float(protein_to_pair_loss.detach().float().cpu()),
+        "pair_to_protein_loss": float(pair_to_protein_loss.detach().float().cpu()),
+        "matrix_cells": positive_mask_cpu.numel(),
+        "positive_cells": positive_cells,
+        "unknown_cells": unknown_cells,
+        "positive_score_sum": float(detached[positive_mask].sum().cpu()),
+        "unknown_score_sum": float(detached[unknown_mask].sum().cpu()),
+    }
+
+
+def triple_structured_negative_loss(
+    model: RecRankModel,
+    triples: list[TripleSample],
+    protein_store: EmbeddingStore,
+    dna_store: EmbeddingStore,
+    rc_map: dict[str, str],
+    device: torch.device,
+    margin: float,
+    softmin_temperature: float,
+) -> tuple[torch.Tensor, dict[str, float | int]]:
+    """Rank each intact positive pair above its one-site explicit corruptions."""
+    if not triples:
+        anchor = next(model.parameters())
+        return anchor.sum() * 0.0, {
+            "comparisons": 0,
+            "active_fraction": 0.0,
+            "positive_score_sum": 0.0,
+            "corrupted_score_sum": 0.0,
+            "margin_sum": 0.0,
+        }
+    protein_keys = [triple.protein_key for triple in triples]
+    protein_vectors = model.project_proteins(
+        protein_store.rows(protein_keys, device=device).float()
+    )
+
+    def aligned_scores(dna_keys: list[str]) -> torch.Tensor:
+        original = model.project_dnas(
+            dna_store.rows(dna_keys, device=device).float()
+        )
+        reverse = model.project_dnas(
+            dna_store.rows([rc_map[key] for key in dna_keys], device=device).float()
+        )
+        direction_invariant = F.normalize(original + reverse, p=2, dim=-1)
+        return (protein_vectors * direction_invariant).sum(dim=-1)
+
+    attp_positive = aligned_scores([triple.attp_pos_key for triple in triples])
+    attb_positive = aligned_scores([triple.attb_pos_key for triple in triples])
+    attp_negative = aligned_scores([triple.attp_neg_key for triple in triples])
+    attb_negative = aligned_scores([triple.attb_neg_key for triple in triples])
+    positive_joint = normalized_softmin(
+        attp_positive, attb_positive, softmin_temperature
+    )
+    corrupted_attp = normalized_softmin(
+        attp_negative, attb_positive, softmin_temperature
+    )
+    corrupted_attb = normalized_softmin(
+        attp_positive, attb_negative, softmin_temperature
+    )
+    corrupted = torch.cat((corrupted_attp, corrupted_attb))
+    repeated_positive = torch.cat((positive_joint, positive_joint))
+    raw = margin - repeated_positive + corrupted
+    losses = F.relu(raw)
+    score_margins = repeated_positive - corrupted
+    return losses.mean(), {
+        "comparisons": int(losses.numel()),
+        "active_fraction": float((raw.detach() > 0).float().mean().cpu()),
+        "positive_score_sum": float(repeated_positive.detach().float().sum().cpu()),
+        "corrupted_score_sum": float(corrupted.detach().float().sum().cpu()),
+        "margin_sum": float(score_margins.detach().float().sum().cpu()),
     }
 
 
@@ -803,6 +1019,34 @@ def train(
     clip_style_loss_weight = float(training_cfg.get("clip_style_loss_weight", 0.0))
     if clip_style_loss_weight < 0:
         raise ValueError("training.clip_style_loss_weight 不能小于 0")
+    bce_loss_weight = float(training_cfg.get("bce_loss_weight", 1.0))
+    triple_aware = bool(training_cfg.get("triple_aware", False))
+    triple_tuple_loss_weight = float(
+        training_cfg.get("triple_tuple_loss_weight", 0.0)
+    )
+    triple_structured_negative_loss_weight = float(
+        training_cfg.get("triple_structured_negative_loss_weight", 0.0)
+    )
+    triple_softmin_temperature = float(
+        training_cfg.get("triple_softmin_temperature", 0.1)
+    )
+    triple_structured_negative_margin = float(
+        training_cfg.get("triple_structured_negative_margin", 0.1)
+    )
+    for name, value in (
+        ("bce_loss_weight", bce_loss_weight),
+        ("triple_tuple_loss_weight", triple_tuple_loss_weight),
+        (
+            "triple_structured_negative_loss_weight",
+            triple_structured_negative_loss_weight,
+        ),
+    ):
+        if value < 0:
+            raise ValueError(f"training.{name} 不能小于 0")
+    if (triple_tuple_loss_weight > 0 or triple_structured_negative_loss_weight > 0) and not triple_aware:
+        raise ValueError("启用 triple loss 时必须设置 training.triple_aware=true")
+    if triple_aware and train_rc_map is None:
+        raise ValueError("triple-aware 训练需要启用反向互补增强并提供完整 RC 映射")
     train_pairs_path = processed / "train_pairs.tsv"
     positive_dnas_by_protein: dict[str, set[str]] = defaultdict(set)
     negative_dnas_by_protein: dict[str, set[str]] = defaultdict(set)
@@ -818,6 +1062,39 @@ def train(
             target[protein_key].add(dna_key)
             if train_rc_map is not None:
                 target[protein_key].add(train_rc_map[dna_key])
+
+    triples_path = processed / "train_triples.jsonl"
+    triples: list[TripleSample] = []
+    positive_pairs_by_protein: dict[str, set[tuple[str, str]]] = defaultdict(set)
+    triple_sampler: TripleEpochBatchSampler | None = None
+    if triple_aware:
+        if not triples_path.exists():
+            raise ValueError(
+                "启用 triple-aware 训练前必须重新运行 prepare，生成 train_triples.jsonl"
+            )
+        triples = load_triples(triples_path)
+        if not triples:
+            raise ValueError("train_triples.jsonl 中没有可训练的完整三元组")
+        expected_triples = training_cfg.get("triple_expected_count")
+        expected_proteins = training_cfg.get("triple_expected_unique_proteins")
+        actual_proteins = len({triple.protein_key for triple in triples})
+        if expected_triples is not None and len(triples) != int(expected_triples):
+            raise ValueError(
+                "完整三元组数量不符合配置："
+                f"expected={expected_triples}, actual={len(triples)}"
+            )
+        if expected_proteins is not None and actual_proteins != int(expected_proteins):
+            raise ValueError(
+                "三元组蛋白数量不符合配置："
+                f"expected={expected_proteins}, actual={actual_proteins}"
+            )
+        for triple in triples:
+            positive_pairs_by_protein[triple.protein_key].add(
+                triple_pair_key(triple, train_rc_map)
+            )
+        triple_sampler = TripleEpochBatchSampler(
+            triples, int(training_cfg["proteins_per_batch"]), seed
+        )
 
     fingerprints = {
         "train_groups_sha256": sha256_file(processed / "train_groups.jsonl"),
@@ -836,9 +1113,17 @@ def train(
         fingerprints["train_dna_ranking_groups_sha256"] = sha256_file(dna_ranking_path)
     if clip_style_loss_weight > 0:
         fingerprints["train_pairs_sha256"] = sha256_file(train_pairs_path)
+    if triple_aware:
+        fingerprints["train_triples_sha256"] = sha256_file(triples_path)
 
     groups = load_groups(processed / "train_groups.jsonl")
-    sampler = EpochBatchSampler(groups, int(training_cfg["proteins_per_batch"]), seed)
+    sampler: EpochBatchSampler | TripleEpochBatchSampler
+    if triple_sampler is not None:
+        sampler = triple_sampler
+    else:
+        sampler = EpochBatchSampler(
+            groups, int(training_cfg["proteins_per_batch"]), seed
+        )
     test_pairs = _load_pairs(processed / "test_pairs.tsv")
     candidate_keys = candidate_store.keys
     if not test_dna_store.contains_all(query_keys):
@@ -972,8 +1257,31 @@ def train(
                     "known_positive_mask": "all_direction_equivalent_train_positives",
                     "negative_denominator": "explicit_negatives_and_all_unknown_cells",
                     "reverse_complement_dnas_in_matrix": rc_augmentation_fraction > 0,
-                    "retains_v1_3_supervised_bce_and_protein_ranking": True,
+                    "retains_v1_3_supervised_bce_and_protein_ranking": (
+                        bce_loss_weight > 0
+                        or float(training_cfg.get("ranking_loss_weight", 0.0)) > 0
+                    ),
                     "interpretation": "experimental_clip_style_unknown_negatives",
+                },
+                "triple_aware_supervision": {
+                    "enabled": triple_aware,
+                    "source_unit": "intact_raw_recombinase_attP_attB_row",
+                    "triple_count": len(triples),
+                    "unique_proteins": len(
+                        {triple.protein_key for triple in triples}
+                    ),
+                    "tuple_loss_weight": triple_tuple_loss_weight,
+                    "structured_negative_loss_weight": (
+                        triple_structured_negative_loss_weight
+                    ),
+                    "structured_negative_margin": (
+                        triple_structured_negative_margin
+                    ),
+                    "softmin_temperature": triple_softmin_temperature,
+                    "site_pair_order_invariant": True,
+                    "strand_score": "cosine_with_normalized_original_plus_reverse_complement",
+                    "joint_score": "normalized_softmin_of_two_site_scores",
+                    "inference_changed": False,
                 },
             },
         )
@@ -1165,6 +1473,22 @@ def train(
             clip_positive_cosine_sum = 0.0
             clip_explicit_negative_cosine_sum = 0.0
             clip_unknown_negative_cosine_sum = 0.0
+            total_tuple_loss_sum = 0.0
+            total_tuple_protein_to_pair_loss_sum = 0.0
+            total_tuple_pair_to_protein_loss_sum = 0.0
+            tuple_batch_count = 0
+            tuple_matrix_cells = 0
+            tuple_positive_cells = 0
+            tuple_unknown_cells = 0
+            tuple_positive_score_sum = 0.0
+            tuple_unknown_score_sum = 0.0
+            total_structured_negative_loss_sum = 0.0
+            structured_batch_count = 0
+            structured_comparisons = 0
+            structured_active_count = 0.0
+            structured_positive_score_sum = 0.0
+            structured_corrupted_score_sum = 0.0
+            structured_margin_sum = 0.0
             total_ranking_loss_sum = 0.0
             ranking_triplet_count = 0
             ranking_active_count = 0.0
@@ -1222,7 +1546,17 @@ def train(
                 else iter(())
             )
 
-            for original_batch in sampler.iter_batches(epoch):
+            if triple_sampler is not None:
+                training_batches = (
+                    (triple_batch, flatten_triple_batch(triple_batch))
+                    for triple_batch in triple_sampler.iter_triple_batches(epoch)
+                )
+            else:
+                training_batches = (
+                    ([], pair_batch) for pair_batch in sampler.iter_batches(epoch)
+                )
+
+            for triple_batch, original_batch in training_batches:
                 if stop_requested:
                     break
                 if train_rc_map is not None:
@@ -1321,6 +1655,51 @@ def train(
                             "explicit_negative_cosine_sum": 0.0,
                             "unknown_negative_cosine_sum": 0.0,
                         }
+                    if triple_tuple_loss_weight > 0:
+                        tuple_loss, batch_tuple_stats = triple_tuple_contrastive_loss(
+                            model,
+                            triple_batch,
+                            train_protein_store,
+                            train_dna_store,
+                            train_rc_map,
+                            positive_pairs_by_protein,
+                            device,
+                            triple_softmin_temperature,
+                        )
+                    else:
+                        tuple_loss = bce_loss * 0.0
+                        batch_tuple_stats = {
+                            "protein_to_pair_loss": 0.0,
+                            "pair_to_protein_loss": 0.0,
+                            "matrix_cells": 0,
+                            "positive_cells": 0,
+                            "unknown_cells": 0,
+                            "positive_score_sum": 0.0,
+                            "unknown_score_sum": 0.0,
+                        }
+                    if triple_structured_negative_loss_weight > 0:
+                        (
+                            structured_negative_loss,
+                            batch_structured_stats,
+                        ) = triple_structured_negative_loss(
+                            model,
+                            triple_batch,
+                            train_protein_store,
+                            train_dna_store,
+                            train_rc_map,
+                            device,
+                            triple_structured_negative_margin,
+                            triple_softmin_temperature,
+                        )
+                    else:
+                        structured_negative_loss = bce_loss * 0.0
+                        batch_structured_stats = {
+                            "comparisons": 0,
+                            "active_fraction": 0.0,
+                            "positive_score_sum": 0.0,
+                            "corrupted_score_sum": 0.0,
+                            "margin_sum": 0.0,
+                        }
                     if rc_consistency_weight > 0:
                         rc_consistency_loss, batch_rc_embedding_cosine = (
                             reverse_complement_consistency_loss(
@@ -1339,11 +1718,14 @@ def train(
                         batch_rc_embedding_cosine = 0.0
                         batch_rc_unique_count = 0
                     loss = (
-                        bce_loss
+                        bce_loss_weight * bce_loss
                         + ranking_weight * ranking_loss
                         + dna_ranking_weight * dna_ranking_loss
                         + rc_consistency_weight * rc_consistency_loss
                         + clip_style_loss_weight * clip_loss
+                        + triple_tuple_loss_weight * tuple_loss
+                        + triple_structured_negative_loss_weight
+                        * structured_negative_loss
                     )
                 if not torch.isfinite(loss):
                     raise FloatingPointError(f"epoch {epoch} step {global_step}: loss 为 NaN/Inf")
@@ -1406,6 +1788,44 @@ def train(
                     clip_unknown_negative_cosine_sum += float(
                         batch_clip_stats["unknown_negative_cosine_sum"]
                     )
+                if triple_tuple_loss_weight > 0:
+                    total_tuple_loss_sum += float(tuple_loss.detach().float().cpu())
+                    total_tuple_protein_to_pair_loss_sum += float(
+                        batch_tuple_stats["protein_to_pair_loss"]
+                    )
+                    total_tuple_pair_to_protein_loss_sum += float(
+                        batch_tuple_stats["pair_to_protein_loss"]
+                    )
+                    tuple_batch_count += 1
+                    tuple_matrix_cells += int(batch_tuple_stats["matrix_cells"])
+                    tuple_positive_cells += int(batch_tuple_stats["positive_cells"])
+                    tuple_unknown_cells += int(batch_tuple_stats["unknown_cells"])
+                    tuple_positive_score_sum += float(
+                        batch_tuple_stats["positive_score_sum"]
+                    )
+                    tuple_unknown_score_sum += float(
+                        batch_tuple_stats["unknown_score_sum"]
+                    )
+                if triple_structured_negative_loss_weight > 0:
+                    total_structured_negative_loss_sum += float(
+                        structured_negative_loss.detach().float().cpu()
+                    )
+                    structured_batch_count += 1
+                    batch_comparisons = int(batch_structured_stats["comparisons"])
+                    structured_comparisons += batch_comparisons
+                    structured_active_count += (
+                        float(batch_structured_stats["active_fraction"])
+                        * batch_comparisons
+                    )
+                    structured_positive_score_sum += float(
+                        batch_structured_stats["positive_score_sum"]
+                    )
+                    structured_corrupted_score_sum += float(
+                        batch_structured_stats["corrupted_score_sum"]
+                    )
+                    structured_margin_sum += float(
+                        batch_structured_stats["margin_sum"]
+                    )
                 total_ranking_loss_sum += (
                     float(ranking_loss.detach().cpu()) * batch_ranking_normalizer
                 )
@@ -1460,6 +1880,24 @@ def train(
                 if clip_batch_count
                 else 0.0
             )
+            mean_tuple_loss = (
+                total_tuple_loss_sum / tuple_batch_count if tuple_batch_count else 0.0
+            )
+            mean_tuple_protein_to_pair_loss = (
+                total_tuple_protein_to_pair_loss_sum / tuple_batch_count
+                if tuple_batch_count
+                else 0.0
+            )
+            mean_tuple_pair_to_protein_loss = (
+                total_tuple_pair_to_protein_loss_sum / tuple_batch_count
+                if tuple_batch_count
+                else 0.0
+            )
+            mean_structured_negative_loss = (
+                total_structured_negative_loss_sum / structured_batch_count
+                if structured_batch_count
+                else 0.0
+            )
             mean_ranking_loss = (
                 total_ranking_loss_sum / protein_ranking_normalizer
                 if protein_ranking_normalizer
@@ -1477,11 +1915,14 @@ def train(
             )
             train_metrics = {
                 "train_loss": (
-                    mean_bce_loss
+                    bce_loss_weight * mean_bce_loss
                     + ranking_weight * mean_ranking_loss
                     + dna_ranking_weight * mean_dna_ranking_loss
                     + rc_consistency_weight * mean_rc_consistency_loss
                     + clip_style_loss_weight * mean_clip_loss
+                    + triple_tuple_loss_weight * mean_tuple_loss
+                    + triple_structured_negative_loss_weight
+                    * mean_structured_negative_loss
                 ),
                 "train_bce_loss": mean_bce_loss,
                 "train_clip_loss": mean_clip_loss,
@@ -1506,6 +1947,50 @@ def train(
                 "train_clip_unknown_negative_cosine_mean": (
                     clip_unknown_negative_cosine_sum / clip_unknown_negative_cells
                     if clip_unknown_negative_cells
+                    else float("nan")
+                ),
+                "train_tuple_loss": mean_tuple_loss,
+                "train_tuple_protein_to_pair_loss": (
+                    mean_tuple_protein_to_pair_loss
+                ),
+                "train_tuple_pair_to_protein_loss": (
+                    mean_tuple_pair_to_protein_loss
+                ),
+                "train_tuple_matrix_cells": tuple_matrix_cells,
+                "train_tuple_positive_cells": tuple_positive_cells,
+                "train_tuple_unknown_cells": tuple_unknown_cells,
+                "train_tuple_positive_score_mean": (
+                    tuple_positive_score_sum / tuple_positive_cells
+                    if tuple_positive_cells
+                    else float("nan")
+                ),
+                "train_tuple_unknown_score_mean": (
+                    tuple_unknown_score_sum / tuple_unknown_cells
+                    if tuple_unknown_cells
+                    else float("nan")
+                ),
+                "train_structured_negative_loss": (
+                    mean_structured_negative_loss
+                ),
+                "train_structured_negative_active_fraction": (
+                    structured_active_count / structured_comparisons
+                    if structured_comparisons
+                    else 0.0
+                ),
+                "train_structured_negative_comparisons": structured_comparisons,
+                "train_structured_positive_score_mean": (
+                    structured_positive_score_sum / structured_comparisons
+                    if structured_comparisons
+                    else float("nan")
+                ),
+                "train_structured_corrupted_score_mean": (
+                    structured_corrupted_score_sum / structured_comparisons
+                    if structured_comparisons
+                    else float("nan")
+                ),
+                "train_structured_margin_mean": (
+                    structured_margin_sum / structured_comparisons
+                    if structured_comparisons
                     else float("nan")
                 ),
                 "train_ranking_loss": mean_ranking_loss,

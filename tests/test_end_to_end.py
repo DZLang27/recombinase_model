@@ -302,6 +302,39 @@ def test_synthetic_training_checkpoint_index_and_screen(tmp_path: Path) -> None:
     generated_v15 = generate_report(v15_run)
     assert (v15_run / "figures" / "clip_style_diagnostics.png") in generated_v15
 
+    # V1.6 samples intact source triples, retains single-DNA InfoNCE, and adds
+    # intact-pair plus explicit one-site-corruption objectives.
+    v16_config = copy.deepcopy(v15_config)
+    v16_config["model"]["version"] = "v1.6-triple-aware"
+    v16_config["training"].update(
+        {
+            "bce_loss_weight": 0.0,
+            "ranking_loss_weight": 0.0,
+            "triple_aware": True,
+            "triple_expected_count": 3,
+            "triple_expected_unique_proteins": 3,
+            "triple_tuple_loss_weight": 0.25,
+            "triple_structured_negative_loss_weight": 0.25,
+            "triple_structured_negative_margin": 0.1,
+            "triple_softmin_temperature": 0.1,
+        }
+    )
+    v16_config["runtime"]["run_root"] = str(tmp_path / "runs_v16")
+    v16_run = train(v16_config, torch.device("cpu"))
+    v16_history = list(csv.DictReader((v16_run / "logs" / "history.csv").open()))
+    last_v16 = v16_history[-1]
+    assert float(last_v16["train_tuple_loss"]) > 0
+    assert float(last_v16["train_tuple_positive_cells"]) >= 3
+    assert float(last_v16["train_tuple_unknown_cells"]) > 0
+    assert float(last_v16["train_structured_negative_comparisons"]) == 6
+    v16_scope = json.loads(
+        (v16_run / "evaluation" / "evaluation_scope.json").read_text()
+    )
+    assert v16_scope["triple_aware_supervision"]["enabled"] is True
+    assert v16_scope["triple_aware_supervision"]["triple_count"] == 3
+    generated_v16 = generate_report(v16_run)
+    assert (v16_run / "figures" / "triple_aware_diagnostics.png") in generated_v16
+
     ensemble_output = tmp_path / "ensemble_eval"
     ensemble_result = evaluate_full_library_ensemble(
         checkpoint_paths=[

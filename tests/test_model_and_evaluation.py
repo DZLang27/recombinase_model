@@ -8,7 +8,7 @@ from rec_rank.evaluation import dense_rank_descending, evaluate_score_matrix, ex
 from rec_rank.embeddings import EmbeddingStore
 from rec_rank.model import RecRankModel
 from rec_rank.model_io import model_from_checkpoint
-from rec_rank.sampler import DnaRankingGroup, SampledPair
+from rec_rank.sampler import DnaRankingGroup, SampledPair, TripleSample
 from rec_rank.training import (
     _augment_training_batch,
     _is_better,
@@ -16,7 +16,11 @@ from rec_rank.training import (
     explicit_ranking_loss,
     grouped_protein_ranking_loss,
     multi_positive_clip_loss,
+    normalized_softmin,
     reverse_complement_consistency_loss,
+    triple_pair_key,
+    triple_structured_negative_loss,
+    triple_tuple_contrastive_loss,
 )
 from rec_rank.utils import read_tsv
 
@@ -237,6 +241,70 @@ def test_multi_positive_clip_loss_uses_full_cross_matrix_and_unknowns() -> None:
     assert stats["active_proteins"] == 2
     assert stats["active_dnas"] == 2
     loss.backward()
+    assert model.raw_gamma.grad is not None
+    assert next(model.protein_projection.parameters()).grad is not None
+    assert next(model.dna_projection.parameters()).grad is not None
+
+
+def test_triple_losses_preserve_pair_relation_and_use_one_site_corruptions() -> None:
+    torch.manual_seed(23)
+    model = RecRankModel(
+        protein_dim=4,
+        dna_dim=3,
+        hidden_dim=8,
+        projection_dim=5,
+        dropout=0.0,
+    )
+    protein_store = EmbeddingStore(
+        keys=["P1", "P2"], embeddings=torch.randn(2, 4), manifest={}
+    )
+    dna_keys = [f"D{index}" for index in range(1, 9)]
+    rc_keys = [f"R{index}" for index in range(1, 9)]
+    dna_store = EmbeddingStore(
+        keys=[*dna_keys, *rc_keys],
+        embeddings=torch.randn(16, 3),
+        manifest={},
+    )
+    rc_map = {dna: rc for dna, rc in zip(dna_keys, rc_keys, strict=True)}
+    rc_map.update({rc: dna for dna, rc in zip(dna_keys, rc_keys, strict=True)})
+    triples = [
+        TripleSample(2, "P1", "D1", "D2", "D3", "D4", 0),
+        TripleSample(3, "P2", "D5", "D6", "D7", "D8", 1),
+    ]
+    positive_pairs = {
+        triple.protein_key: {triple_pair_key(triple, rc_map)} for triple in triples
+    }
+    tuple_loss, tuple_stats = triple_tuple_contrastive_loss(
+        model,
+        triples,
+        protein_store,
+        dna_store,
+        rc_map,
+        positive_pairs,
+        torch.device("cpu"),
+        0.1,
+    )
+    structured_loss, structured_stats = triple_structured_negative_loss(
+        model,
+        triples,
+        protein_store,
+        dna_store,
+        rc_map,
+        torch.device("cpu"),
+        0.1,
+        0.1,
+    )
+    assert torch.isfinite(tuple_loss)
+    assert torch.isfinite(structured_loss)
+    assert tuple_stats["matrix_cells"] == 4
+    assert tuple_stats["positive_cells"] == 2
+    assert tuple_stats["unknown_cells"] == 2
+    assert structured_stats["comparisons"] == 4
+    assert torch.allclose(
+        normalized_softmin(torch.tensor([0.3]), torch.tensor([0.3]), 0.1),
+        torch.tensor([0.3]),
+    )
+    (tuple_loss + structured_loss).backward()
     assert model.raw_gamma.grad is not None
     assert next(model.protein_projection.parameters()).grad is not None
     assert next(model.dna_projection.parameters()).grad is not None

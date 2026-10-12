@@ -74,6 +74,14 @@ def generate_report(run_dir: str | Path) -> list[Path]:
         ax.plot(epochs, _series(history, "train_bce_loss"), label="train BCE")
     if float(training_cfg.get("clip_style_loss_weight", 0.0)) > 0:
         ax.plot(epochs, _series(history, "train_clip_loss"), label="CLIP-style InfoNCE")
+    if float(training_cfg.get("triple_tuple_loss_weight", 0.0)) > 0:
+        ax.plot(epochs, _series(history, "train_tuple_loss"), label="triple tuple InfoNCE")
+    if float(training_cfg.get("triple_structured_negative_loss_weight", 0.0)) > 0:
+        ax.plot(
+            epochs,
+            _series(history, "train_structured_negative_loss"),
+            label="structured negative",
+        )
     if float(training_cfg.get("dna_ranking_loss_weight", 0.0)) > 0:
         ax.plot(
             epochs,
@@ -244,6 +252,63 @@ def generate_report(run_dir: str | Path) -> list[Path]:
         axes[1].legend()
         axes[1].grid(alpha=0.25)
         save(fig, "clip_style_diagnostics.png")
+
+    if float(training_cfg.get("triple_tuple_loss_weight", 0.0)) > 0:
+        fig, axes = plt.subplots(2, 1, figsize=(8, 8), sharex=True)
+        axes[0].plot(
+            epochs,
+            _series(history, "train_tuple_loss"),
+            label="symmetric tuple loss",
+        )
+        axes[0].plot(
+            epochs,
+            _series(history, "train_tuple_protein_to_pair_loss"),
+            label="protein→site pair",
+        )
+        axes[0].plot(
+            epochs,
+            _series(history, "train_tuple_pair_to_protein_loss"),
+            label="site pair→protein",
+        )
+        axes[0].plot(
+            epochs,
+            _series(history, "train_structured_negative_loss"),
+            label="one-site corruption",
+        )
+        axes[0].axvline(best_epoch, color="black", linestyle="--", alpha=0.5)
+        axes[0].set(ylabel="Loss", title="Triple-aware objectives")
+        axes[0].legend()
+        axes[0].grid(alpha=0.25)
+        axes[1].plot(
+            epochs,
+            _series(history, "train_tuple_positive_score_mean"),
+            label="known intact pair",
+        )
+        axes[1].plot(
+            epochs,
+            _series(history, "train_tuple_unknown_score_mean"),
+            label="unknown cross-pair",
+        )
+        axes[1].plot(
+            epochs,
+            _series(history, "train_structured_corrupted_score_mean"),
+            label="explicit one-site corruption",
+        )
+        axes[1].plot(
+            epochs,
+            _series(history, "train_structured_margin_mean"),
+            label="positive−corrupted margin",
+            linestyle=":",
+        )
+        axes[1].axvline(best_epoch, color="black", linestyle="--", alpha=0.5)
+        axes[1].set(
+            xlabel="Epoch",
+            ylabel="Joint score / margin",
+            title="Triple-aware score separation",
+        )
+        axes[1].legend()
+        axes[1].grid(alpha=0.25)
+        save(fig, "triple_aware_diagnostics.png")
 
     if float(training_cfg.get("ranking_loss_weight", 0.0)) > 0 or float(
         training_cfg.get("reverse_complement_augmentation_fraction", 0.0)

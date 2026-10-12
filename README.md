@@ -50,7 +50,7 @@ rec-rank prepare --config configs/v1.yaml
 命令会校验当前数据集的核心不变量，并输出到 `data/processed/`：
 
 - `train_proteins.tsv`、`train_dnas.tsv`
-- `train_pairs.tsv`、`train_groups.jsonl`、`train_conflicts.tsv`
+- `train_pairs.tsv`、`train_groups.jsonl`、`train_triples.jsonl`、`train_conflicts.tsv`
 - `test_candidates.tsv`、`test_dnas.tsv`、`test_pairs.tsv`
 - `test_queries.tsv`、`test_truth.tsv`、`summary.json`
 
@@ -362,3 +362,42 @@ sbatch --export=ALL,SEED=43 scripts/slurm_train_v1_5_clip_style.sh
 
 首轮固定使用 seed 43，与当前最佳的 V1.3 seed 43 做单变量比较；在看到明确收益前不补
 seed 42/44。
+
+## V1.6-triple-aware：保留原始酶–attP–attB 整体关系
+
+V1.6 保留 V1.5 的冻结双塔、残差投影头、完整 38,502 蛋白候选库、单 DNA cosine
+检索和 novel-DNA Recall@10 checkpoint 选择规则。变化只发生在训练数据组织和辅助
+目标中，最终推理仍然只需输入一条 DNA。
+
+数据准备新增 `train_triples.jsonl`，每条记录严格来自同一原始数据行，不再把同一酶
+不同原始行的 attP、attB 独立抽样后重新组合。当前数据有 49,810 条四个 DNA 槽位
+均有效的原始记录；移除涉及冲突 pair 的 2 条后，保留 49,808 条完整三元监督记录，
+覆盖 37,217 个训练蛋白。每个 epoch 每个蛋白轮换选择一条完整记录。
+
+总训练目标为：
+
+`1.0 × 单 DNA multi-positive InfoNCE + 0.25 × 完整位点对 InfoNCE +
+0.25 × 单位点替换结构化负样本 hinge loss`。
+
+- 单 DNA 主目标把同一酶的 attP、attB 及其反向互补序列都作为正例，保持与最终
+  `DNA → protein` 检索任务一致；batch 内其他 unknown 仍按 V1.5 进入分母。
+- 完整位点对目标构造 `batch enzyme × batch (attP, attB)` 的二维矩阵，不构造三维
+  张量。联合分数是两个位点 cosine 的 normalized soft-min，要求两个位点都匹配；
+  attP/attB 顺序不影响 pair identity。
+- 结构化负样本目标只使用原始行提供的显式负序列，比较完整正组合与
+  `(attP_neg, attB_pos)`、`(attP_pos, attB_neg)` 两种单位点破坏组合。
+- 三元目标对每个位点的原序列与反向互补投影求和并重新 L2 归一化，与推理期的方向
+  集成算法一致。V1.5 的 BCE 和 protein-centric ranking 在本版本中的优化权重均为 0，
+  但 BCE/cosine 仍作为诊断日志记录。
+
+先重新运行数据准备以生成 `train_triples.jsonl`；序列集合未改变，因此无需重算已有
+backbone embedding cache：
+
+```bash
+rec-rank prepare --config configs/v1_6_triple_aware.yaml
+sbatch --export=ALL,SEED=43 scripts/slurm_train_v1_6_triple_aware.sh
+```
+
+训练日志和 TensorBoard 额外记录完整位点对的双向 InfoNCE、正/unknown joint score、
+显式单位点破坏的 active fraction 与 margin；静态报告新增
+`triple_aware_diagnostics.png`。
