@@ -106,6 +106,15 @@ rec-rank train --config configs/v1.yaml --device cuda \
   --run-dir runs/<run_id> --resume
 ```
 
+若训练已经正常完成、只想延长总训练轮数，可以在其他配置完全不变时增加
+`--epochs`。续训会恢复 `last.pt` 中的模型、optimizer、AMP scaler、随机状态和
+best 记录，并继续写入原 run；当前自动延长只支持 `scheduler: none`：
+
+```bash
+rec-rank train --config configs/v1.yaml --device cuda \
+  --run-dir runs/<run_id> --resume --epochs 50
+```
+
 每个 run 包含：
 
 ```text
@@ -397,6 +406,14 @@ backbone embedding cache：
 rec-rank prepare --config configs/v1_6_triple_aware.yaml
 sbatch --export=ALL,SEED=43 scripts/slurm_train_v1_6_triple_aware.sh
 ```
+
+当前 seed 43 的 20-epoch run 可从 `last.pt` 接着续训至 epoch 50：
+
+```bash
+sbatch scripts/slurm_extend_v1_6_to_50.sh
+```
+
+该脚本对目标 run 使用独占锁；不要主动并行提交多个写入同一 run 的续训任务。
 
 训练日志和 TensorBoard 额外记录完整位点对的双向 InfoNCE、正/unknown joint score、
 显式单位点破坏的 active fraction 与 margin；静态报告新增

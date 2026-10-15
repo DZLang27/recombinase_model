@@ -335,6 +335,40 @@ def test_synthetic_training_checkpoint_index_and_screen(tmp_path: Path) -> None:
     generated_v16 = generate_report(v16_run)
     assert (v16_run / "figures" / "triple_aware_diagnostics.png") in generated_v16
 
+    # A completed run may be extended by changing only training.epochs. The
+    # continuation must append to the same history and retain full optimizer,
+    # RNG, sampler and best-checkpoint state instead of restarting.
+    v16_extended_config = copy.deepcopy(v16_config)
+    v16_extended_config["training"]["epochs"] = 2
+    resumed_v16_run = train(
+        v16_extended_config,
+        torch.device("cpu"),
+        run_dir=v16_run,
+        resume=True,
+    )
+    assert resumed_v16_run == v16_run
+    extended_history = list(
+        csv.DictReader((v16_run / "logs" / "history.csv").open())
+    )
+    assert [int(row["epoch"]) for row in extended_history] == [0, 1, 2]
+    extended_last = torch.load(
+        v16_run / "checkpoints" / "last.pt",
+        map_location="cpu",
+        weights_only=False,
+    )
+    assert extended_last["epoch"] == 2
+    assert extended_last["resolved_config"]["training"]["epochs"] == 2
+    resolved_v16 = (v16_run / "resolved_config.yaml").read_text(encoding="utf-8")
+    assert "epochs: 2" in resolved_v16
+    v16_manifest = json.loads((v16_run / "manifest.json").read_text())
+    assert v16_manifest["training_extensions"][-1]["previous_target_epochs"] == 1
+    assert v16_manifest["training_extensions"][-1]["target_epochs"] == 2
+    v16_events = [
+        json.loads(line)
+        for line in (v16_run / "logs" / "events.jsonl").read_text().splitlines()
+    ]
+    assert any(event["event"] == "training_extended" for event in v16_events)
+
     ensemble_output = tmp_path / "ensemble_eval"
     ensemble_result = evaluate_full_library_ensemble(
         checkpoint_paths=[

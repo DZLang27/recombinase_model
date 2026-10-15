@@ -11,7 +11,9 @@ from rec_rank.model_io import model_from_checkpoint
 from rec_rank.sampler import DnaRankingGroup, SampledPair, TripleSample
 from rec_rank.training import (
     _augment_training_batch,
+    _capture_rng_state,
     _is_better,
+    _restore_rng_state,
     dna_centric_ranking_loss,
     explicit_ranking_loss,
     grouped_protein_ranking_loss,
@@ -23,6 +25,25 @@ from rec_rank.training import (
     triple_tuple_contrastive_loss,
 )
 from rec_rank.utils import read_tsv
+
+
+def test_restore_rng_state_moves_checkpoint_tensor_to_cpu(monkeypatch) -> None:
+    state = _capture_rng_state()
+    expected_cpu_state = state["torch"]
+
+    class SimulatedCudaRngState:
+        def cpu(self) -> torch.Tensor:
+            return expected_cpu_state
+
+    state["torch"] = SimulatedCudaRngState()
+    state.pop("cuda", None)
+    restored: list[torch.Tensor] = []
+    monkeypatch.setattr(torch, "set_rng_state", restored.append)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+
+    _restore_rng_state(state)
+
+    assert restored == [expected_cpu_state]
 
 
 def test_gamma_is_positive_and_loss_can_decrease() -> None:

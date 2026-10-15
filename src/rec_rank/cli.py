@@ -66,7 +66,14 @@ def build_parser() -> argparse.ArgumentParser:
     train_parser.add_argument("--run-dir")
     train_parser.add_argument("--resume", action="store_true")
     train_parser.add_argument("--seed", type=int)
-    train_parser.add_argument("--epochs", type=int)
+    train_parser.add_argument(
+        "--epochs",
+        type=int,
+        help=(
+            "覆盖训练轮数；与 --resume 同用时仅允许在其他配置完全不变的前提下"
+            "提高总 epoch 上限"
+        ),
+    )
 
     evaluate_parser = subparsers.add_parser("evaluate", help="独立评估一个 checkpoint")
     evaluate_parser.add_argument("--checkpoint", required=True)

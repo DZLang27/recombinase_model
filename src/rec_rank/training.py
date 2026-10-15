@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import platform
 import random
 import signal
@@ -181,9 +182,12 @@ def _capture_rng_state() -> dict[str, Any]:
 def _restore_rng_state(state: dict[str, Any]) -> None:
     random.setstate(state["python"])
     np.random.set_state(state["numpy"])
-    torch.set_rng_state(state["torch"])
+    # A checkpoint loaded with map_location="cuda" also moves the saved CPU
+    # RNG tensor to CUDA. PyTorch's CPU generator only accepts a CPU
+    # ByteTensor, so explicitly move RNG states back before restoring them.
+    torch.set_rng_state(state["torch"].cpu())
     if "cuda" in state and torch.cuda.is_available():
-        torch.cuda.set_rng_state_all(state["cuda"])
+        torch.cuda.set_rng_state_all([rng_state.cpu() for rng_state in state["cuda"]])
 
 
 def _build_checkpoint(
@@ -888,6 +892,100 @@ def _runtime_manifest(config: dict[str, Any], fingerprints: dict[str, Any], run_
     }
 
 
+def _config_without_epoch_limit(config: dict[str, Any]) -> dict[str, Any]:
+    """Return the identity-bearing config, excluding only training.epochs."""
+    comparable = dict(config)
+    comparable["training"] = dict(config["training"])
+    comparable["training"].pop("epochs", None)
+    return comparable
+
+
+def _validate_resume_config(
+    config: dict[str, Any], checkpoint: dict[str, Any]
+) -> dict[str, int] | None:
+    """Validate an exact resume or a controlled epoch-only extension."""
+    completed_epoch = int(checkpoint["epoch"])
+    target_epochs = int(config["training"]["epochs"])
+    if target_epochs <= completed_epoch:
+        raise ValueError(
+            "resume 的 training.epochs 必须大于 checkpoint 已完成的 epoch "
+            f"({target_epochs} <= {completed_epoch})"
+        )
+
+    expected_hash = sha256_text(canonical_json(config))
+    if checkpoint["config_sha256"] == expected_hash:
+        return None
+
+    checkpoint_config = checkpoint.get("resolved_config")
+    if not isinstance(checkpoint_config, dict):
+        raise ValueError("resume 配置与 checkpoint 不一致，且 checkpoint 缺少 resolved_config")
+    if canonical_json(_config_without_epoch_limit(checkpoint_config)) != canonical_json(
+        _config_without_epoch_limit(config)
+    ):
+        raise ValueError("resume 配置与 checkpoint 不一致；续训只允许增加 training.epochs")
+
+    previous_target_epochs = int(checkpoint_config["training"]["epochs"])
+    if target_epochs <= previous_target_epochs:
+        raise ValueError(
+            "epoch-only 续训必须提高 training.epochs "
+            f"({target_epochs} <= {previous_target_epochs})"
+        )
+    if str(config["training"].get("scheduler", "none")).lower() != "none":
+        raise ValueError(
+            "自动延长当前只支持 scheduler=none；带调度器的训练需要显式定义新的学习率轨迹"
+        )
+    return {
+        "completed_epoch": completed_epoch,
+        "previous_target_epochs": previous_target_epochs,
+        "target_epochs": target_epochs,
+    }
+
+
+def _record_resume(
+    run_path: Path,
+    config: dict[str, Any],
+    checkpoint: dict[str, Any],
+    extension: dict[str, int] | None,
+) -> None:
+    resumed_at = utc_now_iso()
+    event: dict[str, Any] = {
+        "event": "training_extended" if extension else "training_resumed",
+        "time": resumed_at,
+        "checkpoint_epoch": int(checkpoint["epoch"]),
+        "target_epochs": int(config["training"]["epochs"]),
+        "checkpoint_config_sha256": checkpoint["config_sha256"],
+        "active_config_sha256": sha256_text(canonical_json(config)),
+    }
+    if extension:
+        event.update(extension)
+        dump_yaml(run_path / "resolved_config.yaml", config)
+        manifest_path = run_path / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["config_sha256"] = event["active_config_sha256"]
+        manifest.setdefault("training_extensions", []).append(
+            {
+                "resumed_at": resumed_at,
+                **extension,
+                "checkpoint_config_sha256": checkpoint["config_sha256"],
+                "active_config_sha256": event["active_config_sha256"],
+            }
+        )
+        atomic_json_dump(manifest_path, manifest)
+    append_jsonl(run_path / "logs" / "events.jsonl", event)
+    atomic_json_dump(
+        run_path / "status.json",
+        {
+            "status": "running",
+            "updated_at": resumed_at,
+            "epoch": int(checkpoint["epoch"]),
+            "best_epoch": (
+                checkpoint["best"]["epoch"] if checkpoint.get("best") else None
+            ),
+            "target_epochs": int(config["training"]["epochs"]),
+        },
+    )
+
+
 def train(
     config: dict[str, Any],
     device: torch.device,
@@ -1203,9 +1301,7 @@ def train(
     seen_pairs: set[tuple[str, str]] = set()
     if resume:
         checkpoint = load_checkpoint(run_path / "checkpoints" / "last.pt", device)
-        expected_hash = sha256_text(canonical_json(config))
-        if checkpoint["config_sha256"] != expected_hash:
-            raise ValueError("resume 配置与 checkpoint 不一致")
+        extension = _validate_resume_config(config, checkpoint)
         if checkpoint["fingerprints"] != fingerprints:
             raise ValueError("resume 数据或 embedding cache 指纹与 checkpoint 不一致")
         model.load_state_dict(checkpoint["model_state"])
@@ -1222,6 +1318,7 @@ def train(
         for epoch_value in range(1, start_epoch):
             for pair in sampler.epoch_pairs(epoch_value):
                 seen_pairs.add((pair.protein_key, pair.dna_key))
+        _record_resume(run_path, config, checkpoint, extension)
     else:
         dump_yaml(run_path / "resolved_config.yaml", config)
         atomic_json_dump(run_path / "manifest.json", _runtime_manifest(config, fingerprints, run_path.name))
